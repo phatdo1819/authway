@@ -1,0 +1,206 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The MSI package of the app, for WiX Toolset 3.14: tools\dist.ps1 builds it with candle and light, one for x64 and
+  one for ARM64, and passes the names of src\product.rs, the version of Cargo.toml and the files as variables.
+
+  It installs the exe and wireguard.dll in Program Files, the service, the start of the app at every sign-in and its
+  entry in the Start menu. The exe does the steps that Windows Installer can't, see src\setup.rs.
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi" xmlns:util="http://schemas.microsoft.com/wix/UtilExtension">
+  <Product Id="*" Name="$(var.Product)" Language="1033" Version="$(var.Version)" Manufacturer="$(var.Manufacturer)"
+           UpgradeCode="$(var.UpgradeCode)">
+    <!-- 500: Windows Installer 5, for the permissions of the service -->
+    <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine"
+             Description="$(var.Product) $(var.Version)" Comments="A VPN client that logs in to the servers that require it" />
+    <!-- a new package replaces the installed one, the same version too: never two of them in the installed apps -->
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <!-- SetInterfaceDnsSettings, for the DNS servers of the tunnels, came with Windows 10 version 2004 -->
+    <Property Id="WINDOWSBUILD">
+      <RegistrySearch Id="WindowsBuild" Root="HKLM" Key="SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+                      Name="CurrentBuildNumber" Type="raw" />
+    </Property>
+    <Condition Message="[ProductName] needs Windows 10 version 2004 or later, or Windows 11.">
+      <![CDATA[Installed OR WINDOWSBUILD >= 19041]]>
+    </Condition>
+<?if $(sys.BUILDARCH) = x64 ?>
+    <!-- Windows on ARM runs the x64 apps, not the x64 driver -->
+    <Condition Message="This package is for x64 computers: on this one, install the package for ARM64.">
+      <![CDATA[Installed OR %PROCESSOR_ARCHITECTURE = "AMD64" OR %PROCESSOR_ARCHITEW6432 = "AMD64"]]>
+    </Condition>
+<?endif?>
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <!-- not a public property: the app finds itself in this folder, see setup::install_dir -->
+        <Directory Id="ProductFolder" Name="$(var.Product)" />
+      </Directory>
+      <Directory Id="ProgramMenuFolder" />
+    </Directory>
+
+    <DirectoryRef Id="ProductFolder">
+      <Component Id="App" Guid="*">
+        <File Id="Exe" Name="$(var.ExeName)" Source="$(var.ExeSource)" KeyPath="yes">
+          <Shortcut Id="StartMenu" Directory="ProgramMenuFolder" Name="$(var.Product)" WorkingDirectory="ProductFolder"
+                    Advertise="no" />
+        </File>
+        <ServiceInstall Id="Service" Name="$(var.ServiceName)" DisplayName="$(var.ServiceDisplayName)"
+                        Description="$(var.ServiceDescription)" Type="ownProcess" Start="auto" ErrorControl="normal"
+                        Account="LocalSystem" Arguments="--service" Vital="yes">
+          <!-- the network has to be there before the service -->
+          <ServiceDependency Id="Nsi" />
+          <ServiceDependency Id="TcpIp" />
+          <!-- started again when it fails -->
+          <util:ServiceConfig FirstFailureActionType="restart" SecondFailureActionType="restart"
+                              ThirdFailureActionType="restart" RestartServiceDelayInSeconds="5" ResetPeriodInDays="1" />
+          <!-- the users can start the service, if it stopped; only the administrators can stop it or change it -->
+          <PermissionEx Id="ServiceSecurity"
+                        Sddl="D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWRPLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)" />
+        </ServiceInstall>
+        <ServiceControl Id="Service" Name="$(var.ServiceName)" Start="install" Stop="both" Remove="uninstall"
+                        Wait="yes" />
+        <!-- the app, at every sign-in of every user -->
+        <RegistryValue Root="HKLM" Key="SOFTWARE\Microsoft\Windows\CurrentVersion\Run" Name="$(var.Product)"
+                       Type="string" Value="&quot;[#Exe]&quot; --startup" />
+      </Component>
+      <!-- shipped as WireGuard LLC signed it, with its license -->
+      <Component Id="WireGuard" Guid="*">
+        <File Id="WireGuardDll" Name="wireguard.dll" Source="$(var.WireGuardDir)\wireguard.dll" KeyPath="yes" />
+      </Component>
+      <Component Id="WireGuardLicense" Guid="*">
+        <File Id="WireGuardLicense" Name="wireguard-LICENSE.txt" Source="$(var.WireGuardLicense)" KeyPath="yes" />
+      </Component>
+      <Component Id="License" Guid="*">
+        <File Id="License" Name="LICENSE.txt" Source="$(var.Root)\LICENSE" KeyPath="yes" />
+      </Component>
+      <!-- the choice of the setup: every user can add and remove VPNs, see settings::users_can_manage -->
+      <Component Id="UserImport" Guid="*">
+        <Condition>ALLOWUSERIMPORT = "1"</Condition>
+        <RegistryValue Root="HKLM" Key="SOFTWARE\$(var.Product)" Name="AllowUserImport" Type="integer" Value="1"
+                       KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <Feature Id="App" Title="$(var.Product)" Level="1" AllowAdvertise="no" Absent="disallow">
+      <ComponentRef Id="App" />
+      <ComponentRef Id="WireGuard" />
+      <ComponentRef Id="WireGuardLicense" />
+      <ComponentRef Id="License" />
+      <ComponentRef Id="UserImport" />
+    </Feature>
+
+    <!--
+      ALLOWUSERIMPORT=1: the users who aren't administrators can add and remove VPNs; the checkbox of the setup, or
+      msiexec ... ALLOWUSERIMPORT=1. An update keeps the choice of the installed version, unless it's given again:
+      the dialogs decide when they're shown, else the value found
+    -->
+    <Property Id="ALLOWUSERIMPORT" Secure="yes" />
+    <Property Id="SAVEDALLOWUSERIMPORT">
+      <RegistrySearch Id="SavedAllowUserImport" Root="HKLM" Key="SOFTWARE\$(var.Product)" Name="AllowUserImport"
+                      Type="raw" />
+    </Property>
+    <SetProperty Action="KeepUserImportForDialogs" Id="ALLOWUSERIMPORT" Value="1" After="AppSearch" Sequence="ui">
+      <![CDATA[NOT ALLOWUSERIMPORT AND SAVEDALLOWUSERIMPORT = "#1"]]>
+    </SetProperty>
+    <SetProperty Action="KeepUserImport" Id="ALLOWUSERIMPORT" Value="1" After="AppSearch" Sequence="execute">
+      <![CDATA[NOT ALLOWUSERIMPORT AND SAVEDALLOWUSERIMPORT = "#1" AND UILevel <= 3]]>
+    </SetProperty>
+
+    <!--
+      The steps of the exe, in the order of the setup:
+      - before Windows looks for the files in use, the app of the user who runs the setup quits, as the user quits it
+        from its menu: it logs out and turns its tunnels off. No dialog asks to close it.
+      - before the service stops, the same for the app of every other user. For an update too: the old package runs
+        them, as it removes the old version
+      - once the service is removed, and only when the app is removed, not updated: the tunnels, the logs and the
+        driver, then the settings and passwords of the user who removes it
+      - once it's all done, the app starts for every user signed in, as at the sign-in
+      They never stop the setup: Return="ignore"
+    -->
+    <CustomAction Id="QuitApp" Directory="ProductFolder" ExeCommand="&quot;[ProductFolder]$(var.ExeName)&quot; --quit"
+                  Execute="immediate" Impersonate="yes" Return="ignore" />
+    <CustomAction Id="StopApps" FileKey="Exe" ExeCommand="--msi-stop-apps" Execute="deferred" Impersonate="no"
+                  Return="ignore" />
+    <CustomAction Id="RemoveData" FileKey="Exe" ExeCommand="--msi-remove-data" Execute="deferred" Impersonate="no"
+                  Return="ignore" />
+    <CustomAction Id="RemoveUserData" FileKey="Exe" ExeCommand="--msi-remove-user-data" Execute="deferred"
+                  Impersonate="yes" TerminalServerAware="yes" Return="ignore" />
+    <CustomAction Id="StartApps" FileKey="Exe" ExeCommand="--msi-start-apps" Execute="commit" Impersonate="no"
+                  Return="ignore" />
+    <!-- the Restart Manager only finds the files in use: it would stop the service and the apps at once, and the
+         apps couldn't log out anymore -->
+    <Property Id="MSIRESTARTMANAGERCONTROL" Value="DisableShutdown" />
+    <InstallExecuteSequence>
+      <Custom Action="QuitApp" Before="InstallValidate">Installed OR WIX_UPGRADE_DETECTED</Custom>
+      <Custom Action="StopApps" Before="StopServices">Installed</Custom>
+      <Custom Action="RemoveData" After="DeleteServices">REMOVE~="ALL" AND NOT UPGRADINGPRODUCTCODE</Custom>
+      <Custom Action="RemoveUserData" After="RemoveData">REMOVE~="ALL" AND NOT UPGRADINGPRODUCTCODE</Custom>
+      <Custom Action="StartApps" After="StartServices">NOT REMOVE~="ALL"</Custom>
+    </InstallExecuteSequence>
+
+    <!-- the installed apps of Windows: no features to change -->
+    <Icon Id="App.ico" SourceFile="$(var.Root)\assets\app.ico" />
+    <Property Id="ARPPRODUCTICON" Value="App.ico" />
+    <Property Id="ARPNOMODIFY" Value="1" />
+
+    <!-- the dialogs of WixUI_Minimal, with no license to accept: welcome, ready, progress, done. The pictures with
+         the icon of the app: tools\make-icons.cmd -->
+    <WixVariable Id="WixUIDialogBmp" Value="$(var.Root)\assets\installer-dialog.bmp" />
+    <WixVariable Id="WixUIBannerBmp" Value="$(var.Root)\assets\installer-banner.bmp" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALTEXT" Value="$(var.Product) is next to the clock: right-click its icon to add your VPN." />
+    <UI Id="Setup">
+      <TextStyle Id="WixUI_Font_Normal" FaceName="Segoe UI" Size="8" />
+      <TextStyle Id="WixUI_Font_Bigger" FaceName="Segoe UI" Size="12" />
+      <TextStyle Id="WixUI_Font_Title" FaceName="Segoe UI" Size="9" Bold="yes" />
+      <Property Id="DefaultUIFont" Value="WixUI_Font_Normal" />
+      <Property Id="WixUI_Mode" Value="Minimal" />
+
+      <DialogRef Id="ErrorDlg" />
+      <DialogRef Id="FatalError" />
+      <DialogRef Id="FilesInUse" />
+      <DialogRef Id="MsiRMFilesInUse" />
+      <DialogRef Id="PrepareDlg" />
+      <DialogRef Id="ProgressDlg" />
+      <DialogRef Id="ResumeDlg" />
+      <DialogRef Id="UserExit" />
+      <DialogRef Id="WelcomeDlg" />
+
+      <Dialog Id="UsersDlg" Width="370" Height="270" Title="[ProductName] Setup">
+        <Control Id="Next" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes"
+                 Text="!(loc.WixUINext)" />
+        <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Text="!(loc.WixUIBack)" />
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Cancel="yes"
+                 Text="!(loc.WixUICancel)">
+          <Publish Event="SpawnDialog" Value="CancelDlg">1</Publish>
+        </Control>
+        <Control Id="BannerBitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="44" TabSkip="no"
+                 Text="WixUI_Bmp_Banner" />
+        <Control Id="Title" Type="Text" X="15" Y="6" Width="280" Height="15" Transparent="yes" NoPrefix="yes"
+                 Text="{\WixUI_Font_Title}Who can add VPNs" />
+        <Control Id="Description" Type="Text" X="25" Y="23" Width="280" Height="15" Transparent="yes" NoPrefix="yes"
+                 Text="Every user can connect the VPNs of this computer. Who can add and remove them?" />
+        <Control Id="BannerLine" Type="Line" X="0" Y="44" Width="370" Height="0" />
+        <Control Id="AllowUserImport" Type="CheckBox" X="20" Y="60" Width="330" Height="18"
+                 Property="ALLOWUSERIMPORT" CheckBoxValue="1"
+                 Text="Every user of this computer, without the permission of an administrator" />
+        <Control Id="Explanation" Type="Text" X="20" Y="84" Width="330" Height="90" NoPrefix="yes"
+                 Text="Unchecked, only an administrator can: Windows asks for the permission each time. A VPN can send all the traffic of the computer through its server and change its DNS servers, so leave it unchecked on a computer that other people use.&#13;&#10;&#13;&#10;An administrator can change it later with the AllowUserImport policy." />
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+      </Dialog>
+
+      <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog" Value="UsersDlg">1</Publish>
+      <Publish Dialog="UsersDlg" Control="Back" Event="NewDialog" Value="WelcomeDlg">1</Publish>
+      <Publish Dialog="UsersDlg" Control="Next" Event="NewDialog" Value="VerifyReadyDlg">1</Publish>
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="UsersDlg" Order="1">NOT Installed</Publish>
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="MaintenanceTypeDlg" Order="2">Installed</Publish>
+      <Publish Dialog="MaintenanceWelcomeDlg" Control="Next" Event="NewDialog" Value="MaintenanceTypeDlg">1</Publish>
+      <Publish Dialog="MaintenanceTypeDlg" Control="RepairButton" Event="NewDialog" Value="VerifyReadyDlg">1</Publish>
+      <Publish Dialog="MaintenanceTypeDlg" Control="RemoveButton" Event="NewDialog" Value="VerifyReadyDlg">1</Publish>
+      <Publish Dialog="MaintenanceTypeDlg" Control="Back" Event="NewDialog" Value="MaintenanceWelcomeDlg">1</Publish>
+      <Publish Dialog="ExitDialog" Control="Finish" Event="EndDialog" Value="Return" Order="999">1</Publish>
+    </UI>
+    <UIRef Id="WixUI_Common" />
+  </Product>
+</Wix>

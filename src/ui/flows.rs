@@ -1,0 +1,284 @@
+// The steps with message boxes, file dialogs or UAC: they run outside of the App, which they reach only for a
+// moment, so that the messages pumped by the dialogs find it free
+
+use std::fs;
+use std::mem::{size_of, zeroed};
+use std::path::{Path, PathBuf};
+use std::ptr;
+use std::thread;
+use std::time::{Duration, Instant};
+
+use windows_sys::Win32::Foundation::HWND;
+use windows_sys::Win32::UI::Controls::Dialogs::{
+    GetOpenFileNameW, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY, OFN_PATHMUSTEXIST, OPENFILENAMEW,
+};
+use windows_sys::Win32::UI::Controls::{
+    TaskDialogIndirect, TASKDIALOGCONFIG, TASKDIALOG_BUTTON, TDF_ALLOW_DIALOG_CANCELLATION, TDF_VERIFICATION_FLAG_CHECKED,
+};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    PostQuitMessage, IDYES, MB_DEFBUTTON2, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING, MB_OK,
+    MB_YESNO,
+};
+
+use super::tray::{running, signal, with_app};
+use super::{instance, message_box};
+use crate::api;
+use crate::conf;
+use crate::ipc::{self, CallError, Request};
+use crate::log;
+use crate::names;
+use crate::setup::{self, quote, CANCELLED};
+use crate::strings;
+use crate::win::wide;
+
+const MAX_FILE: u64 = 64 * 1024;
+const QUIT_LOGOUT_TIMEOUT: Duration = Duration::from_secs(2);
+// the logouts and the tunnels off, before the app quits
+const QUIT_WAIT: Duration = Duration::from_secs(15);
+const BUTTON_CONNECT: i32 = 100;
+const BUTTON_CLOSE: i32 = 101;
+
+fn error_box(owner: HWND, text: &str) {
+    message_box(owner, text, MB_OK | MB_ICONERROR);
+}
+
+fn call_text(error: &CallError) -> String {
+    match error {
+        CallError::Unavailable => strings::service_unavailable(),
+        CallError::Failed(message) => message.clone(),
+    }
+}
+
+// An exe out of the folder of the MSI package: the installed app starts instead, if there is one
+pub fn start_installed() -> i32 {
+    let installed = setup::installed_exe();
+    if installed.exists() && setup::launch(&installed, "") {
+        return 0;
+    }
+    message_box(ptr::null_mut(), &strings::not_installed(), MB_OK | MB_ICONINFORMATION);
+    1
+}
+
+// --quit: the app of this session quits, and this waits until it has, for the setup
+pub fn quit_command() -> i32 {
+    if !signal(&names::tray_quit_event()) {
+        return 1;
+    }
+    let deadline = Instant::now() + QUIT_WAIT;
+    while running() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(100));
+    }
+    0
+}
+
+fn choose_file(owner: HWND) -> Option<PathBuf> {
+    let filter: Vec<u16> = strings::IMPORT_FILTER.replace('|', "\0").encode_utf16().chain([0, 0]).collect();
+    let title = wide(strings::IMPORT_TITLE);
+    let mut file = vec![0u16; 1024];
+    let mut dialog: OPENFILENAMEW = unsafe { zeroed() };
+    dialog.lStructSize = size_of::<OPENFILENAMEW>() as u32;
+    dialog.hwndOwner = owner;
+    dialog.hInstance = instance();
+    dialog.lpstrFilter = filter.as_ptr();
+    dialog.nFilterIndex = 1;
+    dialog.lpstrFile = file.as_mut_ptr();
+    dialog.nMaxFile = file.len() as u32;
+    dialog.lpstrTitle = title.as_ptr();
+    dialog.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
+    if unsafe { GetOpenFileNameW(&mut dialog) } == 0 {
+        return None;
+    }
+    Some(crate::win::path_from_wide(&file))
+}
+
+// UTF-8, with or without its mark, or the UTF-16 of Notepad
+fn read_config(path: &Path) -> Result<String, String> {
+    let size = fs::metadata(path).map_err(|error| error.to_string())?.len();
+    if size > MAX_FILE {
+        return Err("the file is too big".to_string());
+    }
+    let data = fs::read(path).map_err(|error| error.to_string())?;
+    if let Some(rest) = data.strip_prefix(&[0xff, 0xfe]) {
+        let text: Vec<u16> = rest.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect();
+        return String::from_utf16(&text).map_err(|_| "the file isn't text".to_string());
+    }
+    let data = data.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&data);
+    String::from_utf8(data.to_vec()).map_err(|_| "the file isn't text".to_string())
+}
+
+// the name for a tunnel of the file: the name of the server, or of the file
+fn name_for(config: &conf::Config, path: &Path) -> String {
+    let stem = path.file_stem().map(|stem| stem.to_string_lossy().to_string()).unwrap_or_default();
+    conf::name_from(config.server_name().unwrap_or(&stem))
+}
+
+// The configuration checked as the service does it, with the text for the user if it isn't good
+fn load(path: &Path) -> Result<(String, conf::Config), String> {
+    let text = read_config(path).map_err(|error| strings::import_unreadable(&error))?;
+    let config = conf::parse(&text).map_err(|error| strings::import_invalid(&error.to_string()))?;
+    Ok((text, config))
+}
+
+pub fn import_from_file(owner: HWND) {
+    if let Some(path) = choose_file(owner) {
+        import_path(owner, &path);
+    }
+}
+
+pub fn import_path(owner: HWND, path: &Path) {
+    let (text, config) = match load(path) {
+        Ok(loaded) => loaded,
+        Err(message) => return error_box(owner, &message),
+    };
+    let name = name_for(&config, path);
+    let known = with_app(|app| app.tunnel_names()).unwrap_or_default();
+    let replace = known.iter().any(|known| known.eq_ignore_ascii_case(&name));
+    if replace && message_box(owner, &strings::import_exists(&name), MB_YESNO | MB_ICONQUESTION) != IDYES {
+        return;
+    }
+    let request = Request::Import { name: name.clone(), config: text, replace };
+    match ipc::call(&request) {
+        Ok(response) if response.ok => {}
+        Ok(response) if response.error_code() == ipc::ACCESS_DENIED => {
+            // the same steps, as administrator
+            let mut arguments = format!("--import {} --name {}", quote(&path.display().to_string()), quote(&name));
+            if replace {
+                arguments += " --replace";
+            }
+            match setup::elevate(&arguments, owner) {
+                Ok(0) => {}
+                Ok(_) => return,
+                Err(error) if error == CANCELLED => return,
+                Err(error) => return error_box(owner, &error),
+            }
+        }
+        Ok(response) => return error_box(owner, &strings::import_invalid(response.message())),
+        Err(error) => return error_box(owner, &call_text(&error)),
+    }
+    log!("{}: added from {}", name, path.display());
+    with_app(|app| app.list_soon());
+    let file = path.file_name().map(|file| file.to_string_lossy().to_string()).unwrap_or_default();
+    let (connect, delete) = ready_dialog(owner, &name, &file);
+    if delete {
+        if let Err(error) = fs::remove_file(path) {
+            log!("can't delete {}: {}", path.display(), error);
+        }
+    }
+    if connect {
+        with_app(|app| app.connect(&name));
+    }
+}
+
+// "Office is ready": connect now or later, and delete the file, checked
+fn ready_dialog(owner: HWND, name: &str, file: &str) -> (bool, bool) {
+    let title = wide(names::PRODUCT);
+    let instruction = wide(&strings::import_ready(name));
+    let content = wide(strings::IMPORT_SAVED);
+    let verification = wide(&strings::import_delete_file(file));
+    let connect = wide(strings::IMPORT_CONNECT);
+    let close = wide(strings::IMPORT_LATER);
+    let buttons = [
+        TASKDIALOG_BUTTON { nButtonID: BUTTON_CONNECT, pszButtonText: connect.as_ptr() },
+        TASKDIALOG_BUTTON { nButtonID: BUTTON_CLOSE, pszButtonText: close.as_ptr() },
+    ];
+    let mut config: TASKDIALOGCONFIG = unsafe { zeroed() };
+    config.cbSize = size_of::<TASKDIALOGCONFIG>() as u32;
+    config.hwndParent = owner;
+    config.hInstance = instance();
+    config.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION | TDF_VERIFICATION_FLAG_CHECKED;
+    config.pszWindowTitle = title.as_ptr();
+    config.pszMainInstruction = instruction.as_ptr();
+    config.pszContent = content.as_ptr();
+    config.cButtons = buttons.len() as u32;
+    config.pButtons = buttons.as_ptr();
+    config.nDefaultButton = BUTTON_CONNECT;
+    config.pszVerificationText = verification.as_ptr();
+    let mut button = 0;
+    let mut checked = 0;
+    let result = unsafe { TaskDialogIndirect(&config, &mut button, ptr::null_mut(), &mut checked) };
+    if result < 0 {
+        // without the dialog: nothing deleted
+        message_box(owner, &format!("{}\n\n{}", strings::import_ready(name), strings::IMPORT_SAVED), MB_OK);
+        return (false, false);
+    }
+    (button == BUTTON_CONNECT, checked != 0)
+}
+
+// --import <file> --name <name> [--replace], as administrator
+pub fn import_command(path: &Path, name: &str, replace: bool) -> i32 {
+    let (text, _) = match load(path) {
+        Ok(loaded) => loaded,
+        Err(message) => {
+            error_box(ptr::null_mut(), &message);
+            return 1;
+        }
+    };
+    match ipc::call(&Request::Import { name: name.to_string(), config: text, replace }) {
+        Ok(response) if response.ok => 0,
+        Ok(response) => {
+            error_box(ptr::null_mut(), &strings::import_invalid(response.message()));
+            1
+        }
+        Err(error) => {
+            error_box(ptr::null_mut(), &call_text(&error));
+            1
+        }
+    }
+}
+
+pub fn remove(owner: HWND, name: &str) {
+    let answer = message_box(owner, &strings::remove_confirm(name), MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
+    if answer != IDYES {
+        return;
+    }
+    if let Some(Some(page)) = with_app(|app| app.release(name)) {
+        api::logout(&page, Some(QUIT_LOGOUT_TIMEOUT));
+    }
+    match ipc::call(&Request::Remove { name: name.to_string() }) {
+        Ok(response) if response.ok => {}
+        Ok(response) if response.error_code() == ipc::ACCESS_DENIED => {
+            match setup::elevate(&format!("--remove {}", quote(name)), owner) {
+                Ok(0) => {}
+                Ok(_) => return,
+                Err(error) if error == CANCELLED => return,
+                Err(error) => return error_box(owner, &error),
+            }
+        }
+        Ok(response) => return error_box(owner, response.message()),
+        Err(error) => return error_box(owner, &call_text(&error)),
+    }
+    with_app(|app| app.removed(name));
+}
+
+// --remove <name>, as administrator
+pub fn remove_command(name: &str) -> i32 {
+    match ipc::call(&Request::Remove { name: name.to_string() }) {
+        Ok(response) if response.ok => 0,
+        Ok(response) => {
+            error_box(ptr::null_mut(), response.message());
+            1
+        }
+        Err(error) => {
+            error_box(ptr::null_mut(), &call_text(&error));
+            1
+        }
+    }
+}
+
+// The tunnels go off with the app: nobody would watch their session anymore
+pub fn quit(confirm: bool) {
+    let active = with_app(|app| app.active_tunnels()).unwrap_or_default();
+    if confirm && !active.is_empty() && message_box(ptr::null_mut(), &strings::quit_confirm(), MB_YESNO | MB_ICONQUESTION) != IDYES {
+        return;
+    }
+    for (name, page) in active {
+        if let Some(page) = page {
+            api::logout(&page, Some(QUIT_LOGOUT_TIMEOUT));
+        }
+        if let Err(error) = ipc::call(&Request::Down { name: name.clone() }) {
+            log!("{}: can't disconnect: {}", name, error);
+        }
+    }
+    with_app(|app| app.shutdown());
+    unsafe { PostQuitMessage(0) };
+}

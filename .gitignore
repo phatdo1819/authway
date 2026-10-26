@@ -1,0 +1,4 @@
+/target/
+/dist/
+# downloaded by tools\fetch-wireguard.ps1
+/wireguard/
