@@ -12,6 +12,7 @@ pub const STATE_CONNECTED: &str = "connected";
 pub const STATE_NEED_LOGIN: &str = "waiting for the login";
 pub const STATE_BLOCKED: &str = "configuration blocked";
 pub const STATE_NO_USER: &str = "configuration not linked to a user";
+pub const STATE_NO_OTP: &str = "codes of the user not set up";
 
 pub fn state_logged_in(user: &str, until: &str) -> String {
     format!("connected as {} until {}", user, until)
@@ -46,6 +47,9 @@ pub const LOGIN_HINT_OTP: &str =
 pub const LOGIN_CONNECT: &str = "Connect";
 pub const LOGIN_BUSY: &str = "Connecting...";
 pub const CANCEL: &str = "Cancel";
+// the buttons of the questions on macOS, where they say what they do
+pub const REPLACE: &str = "Replace";
+pub const REMOVE: &str = "Remove";
 
 pub fn login_connecting(server: &str) -> String {
     format!("Connecting to {}...", server)
@@ -56,6 +60,8 @@ pub const ERROR_CREDENTIALS: &str = "Wrong username, password or code.";
 pub const ERROR_BLOCKED: &str = "This VPN configuration is blocked: it seems to be used on more than one device at \
                                  the same time. Contact your administrator.";
 pub const ERROR_NO_USER: &str = "This VPN configuration is not linked to a user yet. Contact your administrator.";
+pub const ERROR_NO_OTP: &str =
+    "The one-time codes of your user are not set up. Contact your administrator for a new QR code.";
 pub const ERROR_FORBIDDEN: &str = "The login page doesn't accept this VPN connection. Contact your administrator.";
 pub const ERROR_UNREACHABLE: &str = "Can't reach the login page. Check your internet connection and try again.";
 pub const ERROR_NO_ANSWER: &str =
@@ -94,18 +100,35 @@ pub fn notice_failed(server: &str, reason: &str) -> String {
     format!("Can't connect to {}: {}", server, reason)
 }
 
+// where the icon of the app is
+#[cfg(windows)]
+const PLACE: &str = "next to the clock";
+#[cfg(not(windows))]
+const PLACE: &str = "in the menu bar";
+#[cfg(windows)]
+const OPEN_MENU: &str = "right-click the icon";
+#[cfg(not(windows))]
+const OPEN_MENU: &str = "click the icon";
+// how the system asks for an administrator
+#[cfg(windows)]
+const ADMIN_PROMPT: &str = "Windows will ask for the permission.";
+#[cfg(not(windows))]
+const ADMIN_PROMPT: &str = "macOS will ask for the name and password of an administrator.";
+
 pub fn notice_welcome() -> String {
-    format!("{} is next to the clock. Add your VPN from the file of your administrator: right-click the icon.", PRODUCT)
+    format!("{} is {}. Add your VPN from the file of your administrator: {}.", PRODUCT, PLACE, OPEN_MENU)
 }
 
 pub fn notice_running() -> String {
-    format!("{} is running, next to the clock.", PRODUCT)
+    format!("{} is running, {}.", PRODUCT, PLACE)
 }
 
 pub const IMPORT_TITLE: &str = "Add a VPN";
 pub const IMPORT_FILTER: &str = "VPN configuration (*.conf)|*.conf|All files (*.*)|*.*";
-pub const IMPORT_NEEDS_ADMIN: &str =
-    "Only an administrator can add a VPN on this computer. Windows will ask for the permission.";
+
+pub fn import_needs_admin() -> String {
+    format!("Only an administrator can add a VPN on this computer. {}", ADMIN_PROMPT)
+}
 pub const IMPORT_SAVED: &str =
     "The configuration is saved on this computer, protected: only the VPN service can read its keys.";
 pub const IMPORT_CONNECT: &str = "Connect now";
@@ -135,20 +158,31 @@ pub fn remove_confirm(name: &str) -> String {
     format!("Remove the VPN {} from this computer? You'll need its file to add it again.", name)
 }
 
-pub const REMOVE_NEEDS_ADMIN: &str =
-    "Only an administrator can remove a VPN from this computer. Windows will ask for the permission.";
+pub fn remove_needs_admin() -> String {
+    format!("Only an administrator can remove a VPN from this computer. {}", ADMIN_PROMPT)
+}
 
 pub fn quit_confirm() -> String {
     format!("Disconnect the VPN and quit {}?", PRODUCT)
 }
 
 pub fn service_unavailable() -> String {
-    format!("The VPN service of {} isn't running. Start it from the menu next to the clock, or ask your administrator.", PRODUCT)
+    format!("The VPN service of {} isn't running. Start it from the menu {}, or ask your administrator.", PRODUCT, PLACE)
 }
 
+#[cfg(windows)]
 pub fn not_installed() -> String {
     format!(
         "{} isn't installed on this computer. Install it with its .msi file: Windows asks for the permission of an \
+         administrator, once.",
+        PRODUCT
+    )
+}
+
+#[cfg(not(windows))]
+pub fn not_installed() -> String {
+    format!(
+        "{} isn't installed on this Mac. Install it with its .pkg file: macOS asks for the password of an \
          administrator, once.",
         PRODUCT
     )

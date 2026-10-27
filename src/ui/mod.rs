@@ -1,11 +1,10 @@
-// The app next to the clock, with plain Win32 windows: the state lives in one App on the thread of the windows,
-// reached through with_app(). The modal steps (menus, message boxes, file dialogs, UAC) run outside of it, in
-// flows.rs, so that the messages they pump find the App free.
+// The app next to the clock, with plain Win32 windows: the state lives in one App (client/) on the thread of the
+// windows, reached through with_app(). The modal steps (menus, message boxes, file dialogs, UAC) run outside of
+// it, in flows.rs, so that the messages they pump find the App free.
 
 pub mod connect;
 pub mod details;
 pub mod flows;
-pub mod time;
 pub mod tray;
 
 use std::cell::RefCell;
@@ -40,13 +39,7 @@ pub const WM_APP_IMPORT: u32 = WM_APP + 5;
 #[cfg(feature = "testing")]
 pub const WM_APP_TEST_DETAILS: u32 = WM_APP + 100;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Startup {
-    // started by the user
-    Normal,
-    // at the sign-in to Windows, and after the setup
-    SignIn,
-}
+pub use crate::client::Startup;
 
 pub fn instance() -> HINSTANCE {
     unsafe { GetModuleHandleW(ptr::null()) }

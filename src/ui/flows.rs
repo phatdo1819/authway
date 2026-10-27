@@ -23,7 +23,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use super::tray::{running, signal, with_app};
 use super::{instance, message_box};
 use crate::api;
-use crate::conf;
+use crate::client::import::{load, name_for};
 use crate::ipc::{self, CallError, Request};
 use crate::log;
 use crate::names;
@@ -31,7 +31,6 @@ use crate::setup::{self, quote, CANCELLED};
 use crate::strings;
 use crate::win::wide;
 
-const MAX_FILE: u64 = 64 * 1024;
 const QUIT_LOGOUT_TIMEOUT: Duration = Duration::from_secs(2);
 // the logouts and the tunnels off, before the app quits
 const QUIT_WAIT: Duration = Duration::from_secs(15);
@@ -89,34 +88,6 @@ fn choose_file(owner: HWND) -> Option<PathBuf> {
         return None;
     }
     Some(crate::win::path_from_wide(&file))
-}
-
-// UTF-8, with or without its mark, or the UTF-16 of Notepad
-fn read_config(path: &Path) -> Result<String, String> {
-    let size = fs::metadata(path).map_err(|error| error.to_string())?.len();
-    if size > MAX_FILE {
-        return Err("the file is too big".to_string());
-    }
-    let data = fs::read(path).map_err(|error| error.to_string())?;
-    if let Some(rest) = data.strip_prefix(&[0xff, 0xfe]) {
-        let text: Vec<u16> = rest.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect();
-        return String::from_utf16(&text).map_err(|_| "the file isn't text".to_string());
-    }
-    let data = data.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&data);
-    String::from_utf8(data.to_vec()).map_err(|_| "the file isn't text".to_string())
-}
-
-// the name for a tunnel of the file: the name of the server, or of the file
-fn name_for(config: &conf::Config, path: &Path) -> String {
-    let stem = path.file_stem().map(|stem| stem.to_string_lossy().to_string()).unwrap_or_default();
-    conf::name_from(config.server_name().unwrap_or(&stem))
-}
-
-// The configuration checked as the service does it, with the text for the user if it isn't good
-fn load(path: &Path) -> Result<(String, conf::Config), String> {
-    let text = read_config(path).map_err(|error| strings::import_unreadable(&error))?;
-    let config = conf::parse(&text).map_err(|error| strings::import_invalid(&error.to_string()))?;
-    Ok((text, config))
 }
 
 pub fn import_from_file(owner: HWND) {
@@ -231,8 +202,8 @@ pub fn remove(owner: HWND, name: &str) {
     if answer != IDYES {
         return;
     }
-    if let Some(Some(page)) = with_app(|app| app.release(name)) {
-        api::logout(&page, Some(QUIT_LOGOUT_TIMEOUT));
+    if let Some(Some((page, interface))) = with_app(|app| app.release(name)) {
+        api::logout(&page, interface, Some(QUIT_LOGOUT_TIMEOUT));
     }
     match ipc::call(&Request::Remove { name: name.to_string() }) {
         Ok(response) if response.ok => {}
@@ -271,14 +242,14 @@ pub fn quit(confirm: bool) {
     if confirm && !active.is_empty() && message_box(ptr::null_mut(), &strings::quit_confirm(), MB_YESNO | MB_ICONQUESTION) != IDYES {
         return;
     }
-    for (name, page) in active {
-        if let Some(page) = page {
-            api::logout(&page, Some(QUIT_LOGOUT_TIMEOUT));
+    for (name, session_page) in active {
+        if let Some((page, interface)) = session_page {
+            api::logout(&page, interface, Some(QUIT_LOGOUT_TIMEOUT));
         }
         if let Err(error) = ipc::call(&Request::Down { name: name.clone() }) {
             log!("{}: can't disconnect: {}", name, error);
         }
     }
-    with_app(|app| app.shutdown());
+    super::tray::shutdown();
     unsafe { PostQuitMessage(0) };
 }

@@ -28,6 +28,7 @@ use super::tray::with_app;
 use super::{
     add_dialog, child, get_text, instance, line_height, measure, place, remove_dialog, scale, set_font, set_text, Fonts,
 };
+use crate::client::{LoginValues, LoginView, OTP_LENGTH};
 use crate::creds::SavedLogin;
 use crate::log;
 use crate::names::PRODUCT;
@@ -37,7 +38,6 @@ use crate::win::wide;
 const CLASS: &str = "AuthwayConnect";
 const STYLE: u32 = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
 const EX_STYLE: u32 = WS_EX_APPWINDOW | WS_EX_CONTROLPARENT;
-pub const OTP_LENGTH: usize = 6;
 
 const ID_HEADING: i32 = 100;
 const ID_HINT: i32 = 101;
@@ -52,18 +52,9 @@ const ID_ERROR: i32 = 110;
 const ERROR_COLOR: u32 = 0x001c_1cb9;
 const NOTICE_COLOR: u32 = 0x0012_349a;
 
-pub struct LoginValues {
-    pub username: String,
-    pub password: String,
-    pub code: String,
-    pub remember: bool,
-}
-
 pub struct ConnectWindow {
     pub hwnd: HWND,
     pub tunnel: String,
-    // Connect was pressed before the login page answered: the login goes as soon as it does
-    pub pending_submit: bool,
     pub busy: bool,
     dpi: u32,
     fonts: Fonts,
@@ -155,7 +146,6 @@ impl ConnectWindow {
         let mut window = ConnectWindow {
             hwnd,
             tunnel: tunnel.to_string(),
-            pending_submit: false,
             busy: false,
             dpi,
             heading: child(hwnd, "STATIC", heading, label, 0, ID_HEADING),
@@ -441,6 +431,52 @@ impl ConnectWindow {
     }
 }
 
+impl LoginView for ConnectWindow {
+    fn set_heading(&mut self, text: &str) {
+        ConnectWindow::set_heading(self, text);
+    }
+
+    fn set_hint(&mut self, text: &str) {
+        ConnectWindow::set_hint(self, text);
+    }
+
+    fn set_notice(&mut self, text: Option<&str>) {
+        ConnectWindow::set_notice(self, text);
+    }
+
+    fn set_error(&mut self, text: Option<&str>) {
+        ConnectWindow::set_error(self, text);
+    }
+
+    fn set_otp_required(&mut self, required: bool) {
+        ConnectWindow::set_otp_required(self, required);
+    }
+
+    fn set_busy(&mut self, busy: bool) {
+        ConnectWindow::set_busy(self, busy);
+    }
+
+    fn values(&self) -> LoginValues {
+        ConnectWindow::values(self)
+    }
+
+    fn clear_code(&self) {
+        ConnectWindow::clear_code(self);
+    }
+
+    fn code_changed(&self) -> bool {
+        ConnectWindow::code_changed(self)
+    }
+
+    fn activate(&self) {
+        ConnectWindow::activate(self);
+    }
+
+    fn id(&self) -> usize {
+        self.hwnd as usize
+    }
+}
+
 impl Drop for ConnectWindow {
     fn drop(&mut self) {
         unsafe { DestroyWindow(self.hwnd) };
@@ -471,25 +507,25 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             let code = (wparam >> 16) as u32 & 0xffff;
             match id {
                 IDOK if code == BN_CLICKED => {
-                    with_app(|app| app.submit(hwnd));
+                    with_app(|app| app.submit(hwnd as usize));
                 }
                 IDCANCEL => {
-                    with_app(|app| app.cancel(hwnd));
+                    with_app(|app| app.cancel(hwnd as usize));
                 }
                 ID_CODE if code == EN_CHANGE => {
-                    with_app(|app| app.code_changed(hwnd));
+                    with_app(|app| app.code_changed(hwnd as usize));
                 }
                 _ => {}
             }
             return 0;
         }
         WM_CLOSE => {
-            with_app(|app| app.cancel(hwnd));
+            with_app(|app| app.cancel(hwnd as usize));
             return 0;
         }
         WM_DPICHANGED => {
             let suggested = *(lparam as *const RECT);
-            with_app(|app| app.window_dpi_changed(hwnd, low_word(wparam), &suggested));
+            with_app(|app| app.login_of(hwnd as usize).map(|window| window.dpi_changed(low_word(wparam), &suggested)));
             return 0;
         }
         WM_DESTROY => remove_dialog(hwnd),

@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- The app in the menu bar, at every login of a user: /Library/LaunchAgents/@BUNDLE_ID@.plist. Once quit, it
+     stays quit until the next login, or until the user opens it again. -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>@BUNDLE_ID@</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Applications/@PRODUCT@.app/Contents/MacOS/@EXECUTABLE@</string>
+		<string>--startup</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>LimitLoadToSessionType</key>
+	<string>Aqua</string>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+</dict>
+</plist>

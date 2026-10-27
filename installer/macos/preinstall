@@ -1,0 +1,8 @@
+#!/bin/sh
+# Before the files of a new version replace the old ones: the apps quit and the service stops.
+
+#@COMMON@
+
+quit_apps
+stop_service
+exit 0

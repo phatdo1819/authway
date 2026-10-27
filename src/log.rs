@@ -6,9 +6,9 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use windows_sys::Win32::System::SystemInformation::GetLocalTime;
-
 const MAX_SIZE: u64 = 512 * 1024;
+// the end of a line, as the editor of the system wants it
+const NEWLINE: &str = if cfg!(windows) { "\r\n" } else { "\n" };
 
 static FILE: Mutex<Option<PathBuf>> = Mutex::new(None);
 
@@ -25,7 +25,7 @@ pub fn path() -> Option<PathBuf> {
 
 pub fn write(args: fmt::Arguments) {
     let guard = FILE.lock().unwrap_or_else(|error| error.into_inner());
-    let line = format!("{} {}\r\n", timestamp(), args);
+    let line = format!("{} {}{}", crate::time::timestamp(), args, NEWLINE);
     if cfg!(debug_assertions) || cfg!(feature = "testing") {
         eprint!("{}", line);
     }
@@ -36,15 +36,6 @@ pub fn write(args: fmt::Arguments) {
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
         let _ = file.write_all(line.as_bytes());
     }
-}
-
-fn timestamp() -> String {
-    let mut time = unsafe { std::mem::zeroed() };
-    unsafe { GetLocalTime(&mut time) };
-    format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-        time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute, time.wSecond
-    )
 }
 
 #[macro_export]

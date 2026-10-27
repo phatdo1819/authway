@@ -18,11 +18,13 @@ use crate::win::{last_error_message, new_guid, parse_guid, guid_to_string};
 
 const ENTROPY: &[u8] = b"tunnel configuration";
 
+// of the network adapter of a tunnel: the same at every connection, for Windows to know the network again
+pub type Id = GUID;
+
 pub struct Stored {
     pub name: String,
     pub text: String,
-    // of the network adapter: the same at every connection
-    pub guid: GUID,
+    pub id: Id,
 }
 
 // the tests run the service as the user
@@ -60,8 +62,8 @@ pub fn load(name: &str) -> Result<Stored, String> {
     let key = Key::open(root(), &path(name)).ok_or("not found")?;
     let blob = key.get_binary("Config").ok_or("no configuration")?;
     let text = String::from_utf8(unprotect(&blob)?).map_err(|_| "not UTF-8")?;
-    let guid = key.get_string("Guid").as_deref().and_then(parse_guid).ok_or("no GUID")?;
-    Ok(Stored { name: name.to_string(), text, guid })
+    let id = key.get_string("Guid").as_deref().and_then(parse_guid).ok_or("no GUID")?;
+    Ok(Stored { name: name.to_string(), text, id })
 }
 
 pub fn exists(name: &str) -> bool {
@@ -81,7 +83,7 @@ pub fn save(name: &str, text: &str) -> Result<Stored, String> {
         }
     };
     key.set_binary("Config", &blob)?;
-    Ok(Stored { name: name.to_string(), text: text.to_string(), guid })
+    Ok(Stored { name: name.to_string(), text: text.to_string(), id: guid })
 }
 
 pub fn delete(name: &str) -> Result<(), String> {
@@ -154,7 +156,7 @@ mod tests {
         assert_eq!(read.text, "secret text");
         // replaced, with the same GUID
         let second = save(name, "other").unwrap();
-        assert_eq!(guid_to_string(&first.guid), guid_to_string(&second.guid));
+        assert_eq!(guid_to_string(&first.id), guid_to_string(&second.id));
         assert!(list().iter().any(|stored| stored.name == name));
         delete(name).unwrap();
         assert!(!exists(name));

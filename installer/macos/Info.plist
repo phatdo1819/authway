@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- The app in the menu bar: tools/dist-macos.sh fills in the names and the version -->
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>@BUNDLE_ID@</string>
+	<key>CFBundleName</key>
+	<string>@PRODUCT@</string>
+	<key>CFBundleDisplayName</key>
+	<string>@PRODUCT@</string>
+	<key>CFBundleExecutable</key>
+	<string>@EXECUTABLE@</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>@VERSION@</string>
+	<key>CFBundleVersion</key>
+	<string>@VERSION@</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>11.0</string>
+	<!-- only in the menu bar, not in the Dock -->
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSHumanReadableCopyright</key>
+	<string>MIT License</string>
+</dict>
+</plist>

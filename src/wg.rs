@@ -17,7 +17,8 @@ use windows_sys::Win32::System::LibraryLoader::{
 
 use crate::conf::{Config, Key};
 use crate::log;
-use crate::win::{from_wide_ptr, last_error, last_error_message, wide};
+use crate::manager::PeerStats;
+use crate::win::{filetime_to_unix, from_wide_ptr, last_error, last_error_message, wide};
 
 type AdapterHandle = *mut c_void;
 
@@ -176,15 +177,6 @@ impl WireGuard {
         }
         Ok(())
     }
-}
-
-pub struct PeerStats {
-    pub public_key: Key,
-    pub endpoint: Option<SocketAddr>,
-    pub tx_bytes: u64,
-    pub rx_bytes: u64,
-    // FILETIME, 0 when never
-    pub last_handshake: u64,
 }
 
 // A network adapter of WireGuardNT: it goes away with the adapter
@@ -418,7 +410,8 @@ fn parse_peers(buffer: &[u64], bytes: usize) -> Vec<PeerStats> {
                 endpoint: if peer.flags & PEER_HAS_ENDPOINT != 0 { from_sockaddr(&peer.endpoint) } else { None },
                 tx_bytes: peer.tx_bytes,
                 rx_bytes: peer.rx_bytes,
-                last_handshake: peer.last_handshake,
+                // the driver counts in FILETIME
+                last_handshake: filetime_to_unix(peer.last_handshake),
             });
             offset += size_of::<WgPeer>() + peer.allowed_ips_count as usize * size_of::<WgAllowedIp>();
         }

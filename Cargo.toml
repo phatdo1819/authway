@@ -2,8 +2,8 @@
 name = "authway"
 version = "0.1.0"
 edition = "2021"
-license = "GPL-2.0-only"
-description = "A WireGuard VPN client for Windows that logs in to the servers that require it"
+license = "MIT"
+description = "A WireGuard VPN client for Windows and macOS that logs in to the servers that require it"
 publish = false
 
 [features]
@@ -15,7 +15,7 @@ testing = []
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 
-[dependencies.windows-sys]
+[target.'cfg(windows)'.dependencies.windows-sys]
 version = "0.61.2"
 features = [
     "Win32_Foundation",
@@ -53,6 +53,17 @@ features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ]
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+objc2 = "0.6.5"
+objc2-foundation = "0.3.2"
+objc2-app-kit = { version = "0.3.2", features = ["objc2-uniform-type-identifiers"] }
+objc2-user-notifications = "0.3.2"
+objc2-uniform-type-identifiers = "0.3.2"
+block2 = "0.6.2"
+dispatch2 = "0.3.1"
+security-framework = "3.7.0"
 
 [build-dependencies]
 embed-resource = "3.0.12"

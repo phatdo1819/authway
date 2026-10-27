@@ -1,24 +1,36 @@
-// How the app talks to the service: one JSON request and one JSON answer per connection to its named pipe,
-// each on one line
+// How the app talks to the service: one JSON request and one JSON answer per connection, each on one line. On
+// Windows through the named pipe of the service, on macOS through its socket.
 
+#[cfg(windows)]
 use std::mem::{size_of, zeroed};
+#[cfg(windows)]
 use std::ptr;
 
+#[cfg(windows)]
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+#[cfg(windows)]
 use windows_sys::Win32::Foundation::{ERROR_BROKEN_PIPE, ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_PIPE_BUSY, HANDLE};
+#[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, ReadFile, WriteFile, FILE_GENERIC_READ, FILE_WRITE_DATA, OPEN_EXISTING, SECURITY_IDENTIFICATION,
     SECURITY_SQOS_PRESENT,
 };
+#[cfg(windows)]
 use windows_sys::Win32::System::Pipes::{GetNamedPipeServerProcessId, WaitNamedPipeW};
+#[cfg(windows)]
 use windows_sys::Win32::System::Services::{
     CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceStatusEx, SC_MANAGER_CONNECT, SC_STATUS_PROCESS_INFO,
     SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_STATUS_PROCESS,
 };
 
+#[cfg(windows)]
 use crate::names;
+#[cfg(windows)]
 use crate::win::{error_message, last_error, wide, Handle};
+
+#[cfg(target_os = "macos")]
+pub use unix::{call, peer_uid, read_from, write_to};
 
 pub const MAX_MESSAGE: usize = 1024 * 1024;
 
@@ -89,6 +101,10 @@ pub struct TunnelInfo {
     pub addresses: Vec<String>,
     #[serde(default)]
     pub routes: Vec<String>,
+    // the index of the network adapter of the tunnel while it's on, 0 else: the requests to the login page go out
+    // only through it
+    #[serde(default)]
+    pub interface: u32,
     // seconds since 1970, 0 for never
     #[serde(default)]
     pub since: u64,
@@ -154,6 +170,7 @@ pub struct PeerInfo {
     pub tx_bytes: u64,
 }
 
+#[cfg(windows)]
 pub fn write_message<T: Serialize>(pipe: HANDLE, message: &T) -> Result<(), String> {
     let mut data = serde_json::to_vec(message).map_err(|error| error.to_string())?;
     data.push(b'\n');
@@ -170,6 +187,7 @@ pub fn write_message<T: Serialize>(pipe: HANDLE, message: &T) -> Result<(), Stri
     Ok(())
 }
 
+#[cfg(windows)]
 pub fn read_message<T: DeserializeOwned>(pipe: HANDLE) -> Result<T, String> {
     let mut data = Vec::new();
     let mut buffer = [0u8; 4096];
@@ -201,6 +219,7 @@ pub fn read_message<T: DeserializeOwned>(pipe: HANDLE) -> Result<T, String> {
 }
 
 // the process of the service, to know that the pipe is its own and not one of a program that took its name
+#[cfg(windows)]
 pub fn service_process_id() -> Option<u32> {
     unsafe {
         let manager = OpenSCManagerW(ptr::null(), ptr::null(), SC_MANAGER_CONNECT);
@@ -245,6 +264,7 @@ impl std::fmt::Display for CallError {
     }
 }
 
+#[cfg(windows)]
 fn connect() -> Result<Handle, CallError> {
     let name = wide(&names::pipe());
     for _ in 0..10 {
@@ -275,6 +295,7 @@ fn connect() -> Result<Handle, CallError> {
     Err(CallError::Failed("the service is busy".to_string()))
 }
 
+#[cfg(windows)]
 fn check_server(pipe: &Handle) -> Result<(), CallError> {
     if cfg!(feature = "testing") {
         return Ok(());
@@ -290,11 +311,84 @@ fn check_server(pipe: &Handle) -> Result<(), CallError> {
     }
 }
 
+#[cfg(windows)]
 pub fn call(request: &Request) -> Result<Response, CallError> {
     let pipe = connect()?;
     check_server(&pipe)?;
     write_message(pipe.0, request).map_err(CallError::Failed)?;
     read_message(pipe.0).map_err(CallError::Failed)
+}
+
+// The socket of the service: only root can create it where it is, and the app checks that root answers
+#[cfg(target_os = "macos")]
+mod unix {
+    use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    use std::os::unix::io::AsRawFd;
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+
+    use serde::de::DeserializeOwned;
+    use serde::Serialize;
+
+    use super::{CallError, Request, Response, MAX_MESSAGE};
+    use crate::names;
+
+    // a tunnel turns on in a few seconds, the lookups of its servers included
+    const TIMEOUT: Duration = Duration::from_secs(60);
+
+    pub fn write_to<T: Serialize>(stream: &mut impl Write, message: &T) -> Result<(), String> {
+        let mut data = serde_json::to_vec(message).map_err(|error| error.to_string())?;
+        data.push(b'\n');
+        stream
+            .write_all(&data)
+            .and_then(|_| stream.flush())
+            .map_err(|error| format!("can't write to the service: {}", error))
+    }
+
+    pub fn read_from<T: DeserializeOwned>(stream: &mut impl Read) -> Result<T, String> {
+        let mut data = Vec::new();
+        let mut reader = BufReader::new(Read::take(stream, MAX_MESSAGE as u64 + 1));
+        reader.read_until(b'\n', &mut data).map_err(|error| format!("can't read from the socket: {}", error))?;
+        if data.len() > MAX_MESSAGE {
+            return Err("the message is too long".to_string());
+        }
+        let end = data.iter().position(|&byte| byte == b'\n').unwrap_or(data.len());
+        serde_json::from_slice(&data[..end]).map_err(|error| format!("not a message: {}", error))
+    }
+
+    // the user at the other end of a connection
+    pub fn peer_uid(stream: &UnixStream) -> Option<u32> {
+        let (mut uid, mut gid) = (0, 0);
+        (unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } == 0).then_some(uid)
+    }
+
+    fn check_server(stream: &UnixStream) -> Result<(), CallError> {
+        if cfg!(feature = "testing") {
+            return Ok(());
+        }
+        let socket = std::fs::symlink_metadata(names::socket_path());
+        let owned = socket.is_ok_and(|socket| socket.file_type().is_socket() && socket.uid() == 0);
+        if !owned || peer_uid(stream) != Some(0) {
+            return Err(CallError::Failed("another program took the name of the socket of the service".to_string()));
+        }
+        Ok(())
+    }
+
+    pub fn call(request: &Request) -> Result<Response, CallError> {
+        let mut stream = match UnixStream::connect(names::socket_path()) {
+            Ok(stream) => stream,
+            Err(error) if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::ConnectionRefused) => {
+                return Err(CallError::Unavailable)
+            }
+            Err(error) => return Err(CallError::Failed(format!("can't reach the service: {}", error))),
+        };
+        check_server(&stream)?;
+        let _ = stream.set_read_timeout(Some(TIMEOUT));
+        let _ = stream.set_write_timeout(Some(TIMEOUT));
+        write_to(&mut stream, request).map_err(CallError::Failed)?;
+        read_from(&mut stream).map_err(CallError::Failed)
+    }
 }
 
 #[cfg(test)]

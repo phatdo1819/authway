@@ -32,7 +32,24 @@ static class MakeIcons
         Write(Path.Combine(args[0], "attention.ico"), Attention, TraySizes);
         Write(Path.Combine(args[0], "refused.ico"), Refused, TraySizes);
         WriteInstallerImages(args[0]);
+        WriteMacIcon(Path.Combine(args[0], "app-macos.png"));
         return 0;
+    }
+
+    // The icon of the macOS app, for tools/dist-macos.sh: the grid of the icons of macOS, a square of 824 pixels
+    // in 1024 with room for the shadow
+    static void WriteMacIcon(string path)
+    {
+        using (var canvas = new Bitmap(1024, 1024, PixelFormat.Format32bppArgb))
+        {
+            using (var graphics = Graphics.FromImage(canvas))
+            using (var icon = Draw(824, Brand, Color.White))
+            {
+                graphics.Clear(Color.Transparent);
+                graphics.DrawImage(icon, 100, 92, 824, 824);
+            }
+            canvas.Save(path, ImageFormat.Png);
+        }
     }
 
     // At the sizes of WixUI: the welcome and last pages, with the icon on the left; the banner of the other pages,

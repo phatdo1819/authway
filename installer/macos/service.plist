@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- The service, as root, from the start of the Mac: /Library/LaunchDaemons/@BUNDLE_ID@.service.plist. Its copy
+     of the program is in a folder that only root can change, unlike /Applications. -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>@BUNDLE_ID@.service</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>@SUPPORT_DIR@/@EXECUTABLE@</string>
+		<string>--service</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<!-- the time to turn the tunnels off and put the DNS servers back -->
+	<key>ExitTimeOut</key>
+	<integer>30</integer>
+	<!-- what the service can't write in its log, like a crash -->
+	<key>StandardErrorPath</key>
+	<string>/Library/Logs/@PRODUCT@/service-errors.log</string>
+</dict>
+</plist>

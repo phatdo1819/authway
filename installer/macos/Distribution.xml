@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The package of the app, for productbuild: tools/dist-macos.sh fills in the names and the version -->
+<installer-gui-script minSpecVersion="2">
+    <title>@PRODUCT@ @VERSION@</title>
+    <license file="LICENSE.txt"/>
+    <options customize="never" require-scripts="true" hostArchitectures="arm64,x86_64"/>
+    <domains enable_anywhere="false" enable_currentUserHome="false" enable_localSystem="true"/>
+    <volume-check>
+        <allowed-os-versions>
+            <os-version min="11.0"/>
+        </allowed-os-versions>
+    </volume-check>
+    <choices-outline>
+        <line choice="default">
+            <line choice="@BUNDLE_ID@"/>
+        </line>
+    </choices-outline>
+    <choice id="default"/>
+    <choice id="@BUNDLE_ID@" visible="false">
+        <pkg-ref id="@BUNDLE_ID@"/>
+    </choice>
+    <pkg-ref id="@BUNDLE_ID@" version="@VERSION@" onConclusion="none">@COMPONENT@</pkg-ref>
+</installer-gui-script>

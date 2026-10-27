@@ -13,6 +13,9 @@ use crate::api::Page;
 use crate::names;
 use crate::win::{from_wide_ptr, wide};
 
+// for the log
+pub const STORE_NAME: &str = "the Credential Manager";
+
 #[derive(Default)]
 pub struct SavedLogin {
     pub username: String,

@@ -2,17 +2,19 @@
 //   GET  /api/status   {"authenticated", "otp_required", "server", "user", "expires", "blocked", "no_user"}
 //   POST /api/login    {"username", "password", "otp"}
 //   POST /api/logout
-// Plain HTTP to an address of the tunnel, never through a proxy.
+// Plain HTTP to an address of the tunnel, never through a proxy. The requests go out only through the network
+// adapter of the tunnel, `interface` (its index), and only to an address of its routes: the password never goes
+// another way, whatever the routes of the local network say.
 
 use std::fmt;
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
 use std::time::Duration;
 
 use serde_json::{Map, Value};
 
 use crate::conf::{Config, IpNet};
-use crate::names;
+use crate::{log, names, net};
 
 pub const DEFAULT_PORT: u16 = 8181;
 pub const WEB_PORT: u16 = 80;
@@ -139,36 +141,44 @@ impl fmt::Display for ApiResult {
     }
 }
 
-pub fn status(page: &Page) -> ApiResult {
-    send("GET", page, "/api/status", None, REQUEST_TIMEOUT)
+pub fn status(page: &Page, interface: u32) -> ApiResult {
+    send("GET", page, interface, "/api/status", None, REQUEST_TIMEOUT)
 }
 
-pub fn login(page: &Page, username: &str, password: &str, otp: &str) -> ApiResult {
+pub fn login(page: &Page, interface: u32, username: &str, password: &str, otp: &str) -> ApiResult {
     let body = serde_json::json!({ "username": username, "password": password, "otp": otp });
-    send("POST", page, "/api/login", Some(&body), REQUEST_TIMEOUT)
+    send("POST", page, interface, "/api/login", Some(&body), REQUEST_TIMEOUT)
 }
 
-pub fn logout(page: &Page, timeout: Option<Duration>) -> ApiResult {
-    send("POST", page, "/api/logout", Some(&serde_json::json!({})), timeout.unwrap_or(REQUEST_TIMEOUT))
+pub fn logout(page: &Page, interface: u32, timeout: Option<Duration>) -> ApiResult {
+    let body = serde_json::json!({});
+    send("POST", page, interface, "/api/logout", Some(&body), timeout.unwrap_or(REQUEST_TIMEOUT))
 }
 
-// The login page reached through one of the addresses, None if none leads to one
-pub fn discover(candidates: &[Ipv4Addr], login_port: u16, web_port: u16) -> Option<Page> {
-    for &host in candidates {
+// The login page reached through one of the addresses, None if none leads to one. Only an address of the routes
+// of the tunnel, the one of the redirect too: anyone could answer at another one, and get the password.
+pub fn discover(
+    candidates: &[Ipv4Addr],
+    routes: &[IpNet],
+    interface: u32,
+    login_port: u16,
+    web_port: u16,
+) -> Option<Page> {
+    for &host in candidates.iter().filter(|&&host| routed(routes, host)) {
         // the login page on its port: it answers when the redirect is off, or the user is logged in
         let page = Page { host, port: login_port };
-        if is_login_page(&page) {
+        if is_login_page(&page, interface) {
             return Some(page);
         }
         // the redirect of ns-wgauth sends any web request of a peer that isn't logged in to the login page
         let web = Page { host, port: web_port };
-        let answer = exchange("GET", &web, "/", None, "*/*", PROBE_TIMEOUT);
+        let answer = exchange("GET", &web, interface, "/", None, "*/*", PROBE_TIMEOUT);
         if let Ok((status, location, _)) = answer {
             if (300..400).contains(&status) {
-                if let Some(page) = location.as_deref().and_then(Page::parse) {
-                    if is_login_page(&page) {
-                        return Some(page);
-                    }
+                match location.as_deref().and_then(Page::parse) {
+                    Some(page) if !routed(routes, page.host) => log!("{} leads to {}, out of the VPN", web, page),
+                    Some(page) if is_login_page(&page, interface) => return Some(page),
+                    _ => {}
                 }
             }
         }
@@ -176,13 +186,18 @@ pub fn discover(candidates: &[Ipv4Addr], login_port: u16, web_port: u16) -> Opti
     None
 }
 
-fn is_login_page(page: &Page) -> bool {
-    let result = send("GET", page, "/api/status", None, PROBE_TIMEOUT);
+// whether the address is reached through the tunnel
+pub fn routed(routes: &[IpNet], host: Ipv4Addr) -> bool {
+    routes.iter().any(|route| route.contains(IpAddr::V4(host)))
+}
+
+fn is_login_page(page: &Page, interface: u32) -> bool {
+    let result = send("GET", page, interface, "/api/status", None, PROBE_TIMEOUT);
     result.status == 200 && result.has("authenticated") && result.has("otp_required")
 }
 
 // Where the login page can be: the firewall gives a WireGuard server the first address of its network, and the
-// peers route that network through the tunnel
+// peers route that network through the tunnel. Never an address out of the routes.
 pub fn candidates(config: &Config) -> Vec<Ipv4Addr> {
     candidates_of(&config.addresses, &config.routes())
 }
@@ -192,7 +207,8 @@ pub fn candidates_of(addresses: &[IpNet], routes: &[IpNet]) -> Vec<Ipv4Addr> {
     let mut result: Vec<Ipv4Addr> = Vec::new();
     let mut add = |candidate: Option<Ipv4Addr>| {
         if let Some(candidate) = candidate {
-            if !result.contains(&candidate) && !own.contains(&IpAddr::V4(candidate)) {
+            let new = !result.contains(&candidate) && !own.contains(&IpAddr::V4(candidate));
+            if new && routed(routes, candidate) {
                 result.push(candidate);
             }
         }
@@ -207,7 +223,8 @@ pub fn candidates_of(addresses: &[IpNet], routes: &[IpNet]) -> Vec<Ipv4Addr> {
             }
         }
     }
-    // with all the traffic through the tunnel there's no such route: guess the network from the address
+    // with all the traffic through the tunnel there's no such route: guess the network from the address (a guess
+    // out of the routes would go to the local network)
     for address in &own {
         add(IpNet { addr: *address, prefix: GUESSED_PREFIX }.first_host());
     }
@@ -219,26 +236,26 @@ fn user_agent() -> String {
     format!("{}/{}", names::PRODUCT.replace(' ', "-"), names::VERSION)
 }
 
-fn send(method: &str, page: &Page, path: &str, body: Option<&Value>, timeout: Duration) -> ApiResult {
+fn send(method: &str, page: &Page, interface: u32, path: &str, body: Option<&Value>, timeout: Duration) -> ApiResult {
     let body = body.map(|body| body.to_string());
-    match exchange(method, page, path, body.as_deref(), "application/json", timeout) {
+    match exchange(method, page, interface, path, body.as_deref(), "application/json", timeout) {
         Ok((status, location, body)) => ApiResult::from_body(status, &body, location),
         Err(error) => ApiResult::unreachable(error.to_string()),
     }
 }
 
-// One request on its own connection, closed by the server after the answer: the status, the Location header and
-// the body
+// One request on its own connection through the network adapter of the tunnel, closed by the server after the
+// answer: the status, the Location header and the body
 fn exchange(
     method: &str,
     page: &Page,
+    interface: u32,
     path: &str,
     body: Option<&str>,
     accept: &str,
     timeout: Duration,
 ) -> io::Result<(u16, Option<String>, Vec<u8>)> {
-    let address = SocketAddr::from((page.host, page.port));
-    let mut stream = TcpStream::connect_timeout(&address, timeout)?;
+    let mut stream = net::connect_through(SocketAddrV4::new(page.host, page.port), interface, timeout)?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
     let _ = stream.set_nodelay(true);
@@ -318,6 +335,10 @@ fn dechunk(mut data: &[u8]) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
     use crate::conf;
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::thread;
 
     #[test]
     fn pages() {
@@ -370,5 +391,65 @@ mod tests {
         assert_eq!(config("10.8.5.2", "10.8.0.0/16"), vec![ip("10.8.0.1"), ip("10.8.5.1")]);
         // the address itself is never a candidate
         assert_eq!(config("10.103.1.1", "0.0.0.0/0"), Vec::<Ipv4Addr>::new());
+        // nor a guess out of the routes: it would go to the local network
+        assert_eq!(config("10.103.1.2", "192.168.1.0/24"), Vec::<Ipv4Addr>::new());
+        assert_eq!(config("10.103.1.2/24", "192.168.1.0/24"), Vec::<Ipv4Addr>::new());
+    }
+
+    // A server on 127.0.0.x that gives the same answer to every request, and counts them
+    fn serve(host: Ipv4Addr, answer: String) -> (u16, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind((host, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let count = Arc::new(AtomicUsize::new(0));
+        let counter = count.clone();
+        thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+                let mut data = [0u8; 4096];
+                if stream.read(&mut data).unwrap_or(0) > 0 {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let _ = stream.write_all(answer.as_bytes());
+                }
+            }
+        });
+        (port, count)
+    }
+
+    fn reply(status: &str, headers: &str, body: &str) -> String {
+        format!("HTTP/1.1 {}\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}", status, headers, body.len(), body)
+    }
+
+    #[test]
+    fn only_through_the_tunnel() {
+        let loopback = net::best_interface(&"127.0.0.1:0".parse().unwrap()).unwrap();
+        let ip = |text: &str| text.parse::<Ipv4Addr>().unwrap();
+        let net = |text: &str| IpNet::parse(text).unwrap();
+        // the login page on 127.0.0.2, and the redirect of the web port of 127.0.0.1 to it
+        let answer = reply("200 OK", "", r#"{"authenticated":false,"otp_required":true}"#);
+        let (login_port, logins) = serve(ip("127.0.0.2"), answer);
+        let location = format!("Location: http://127.0.0.2:{}/\r\n", login_port);
+        let (web_port, webs) = serve(ip("127.0.0.1"), reply("302 Found", &location, ""));
+        let page = Page { host: ip("127.0.0.2"), port: login_port };
+
+        // a redirect out of the routes: never followed
+        let found = discover(&[ip("127.0.0.1")], &[net("127.0.0.1/32")], loopback, login_port, web_port);
+        assert_eq!((found, webs.load(Ordering::SeqCst), logins.load(Ordering::SeqCst)), (None, 1, 0));
+        // nor a candidate out of the routes
+        assert_eq!(discover(&[ip("127.0.0.1")], &[net("10.0.0.0/8")], loopback, login_port, web_port), None);
+        assert_eq!(webs.load(Ordering::SeqCst), 1);
+        // in the routes
+        let found = discover(&[ip("127.0.0.1")], &[net("127.0.0.0/8")], loopback, login_port, web_port);
+        assert_eq!(found, Some(page));
+        assert!(status(&page, loopback).get_bool("otp_required"));
+        let before = logins.load(Ordering::SeqCst);
+
+        // through another network adapter, or one not known yet: nothing is sent
+        let internet = net::best_interface(&"192.0.2.1:0".parse().unwrap()).filter(|&index| index != loopback);
+        for interface in internet.into_iter().chain([0]) {
+            let result = login(&page, interface, "alice", "Secret,1234", "123456");
+            assert!(!result.reached(), "{}: {}", interface, result);
+        }
+        thread::sleep(Duration::from_millis(200));
+        assert_eq!(logins.load(Ordering::SeqCst), before);
     }
 }

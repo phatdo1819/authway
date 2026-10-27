@@ -4,7 +4,6 @@ use std::ffi::OsString;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::ptr;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use windows_sys::core::GUID;
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, LocalFree, HANDLE, INVALID_HANDLE_VALUE};
@@ -114,9 +113,7 @@ pub fn known_folder(id: &GUID) -> Option<PathBuf> {
     folder
 }
 
-pub fn unix_now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|time| time.as_secs()).unwrap_or(0)
-}
+pub use crate::time::unix_now;
 
 // a FILETIME count of 100 ns since 1601 as seconds since 1970, 0 for never
 pub fn filetime_to_unix(time: u64) -> u64 {

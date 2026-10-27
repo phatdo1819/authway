@@ -23,6 +23,11 @@ fn quoted(path: &Path) -> String {
 }
 
 fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
+    // the bundle of macOS has its own Info.plist, made by tools/dist-macos.sh
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
     let root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
     let version = env::var("CARGO_PKG_VERSION").unwrap();

@@ -1,0 +1,25 @@
+#!/bin/sh
+# After the files: the service starts, and the app for the user at the screen; the other users get it at their
+# next login.
+
+#@COMMON@
+
+chown -R root:wheel "$SUPPORT"
+chmod 755 "$SUPPORT" "$SUPPORT/$EXECUTABLE" "$SUPPORT/wireguard-go" "$SUPPORT/uninstall.sh"
+# the configurations of the tunnels, with their private keys
+if [ -d "$SUPPORT/tunnels" ]; then
+    chmod 700 "$SUPPORT/tunnels"
+fi
+mkdir -p "$LOGS"
+chown root:wheel "$DAEMON_PLIST" "$AGENT_PLIST"
+chmod 644 "$DAEMON_PLIST" "$AGENT_PLIST"
+
+stop_service
+launchctl bootstrap system "$DAEMON_PLIST"
+
+uid=$(stat -f %u /dev/console)
+if [ -n "$uid" ] && [ "$uid" != 0 ]; then
+    launchctl bootout "gui/$uid/$BUNDLE_ID" 2>/dev/null
+    launchctl bootstrap "gui/$uid" "$AGENT_PLIST"
+fi
+exit 0

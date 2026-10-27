@@ -57,3 +57,21 @@ pub fn tray_quit_event() -> String {
 pub fn run_value() -> String {
     format!("{}{}", PRODUCT, suffix())
 }
+
+// macOS: the socket of the service, in a folder only root can write to, so no other program takes its name
+pub fn socket_path() -> String {
+    if cfg!(feature = "testing") {
+        format!("/tmp/{}-test.sock", PRODUCT.to_lowercase())
+    } else {
+        format!("/var/run/{}.sock", PRODUCT.to_lowercase())
+    }
+}
+
+// the launchd jobs: the service, as root, and the app, at every login
+pub fn service_label() -> String {
+    format!("{}.service", BUNDLE_ID)
+}
+
+pub fn agent_label() -> String {
+    BUNDLE_ID.to_string()
+}

@@ -1,10 +1,20 @@
 # Authway
 
-A WireGuard VPN client for Windows 10 and 11, in one app: it connects the tunnel and, for the servers that require
-it, logs in with username, password and the code of an authenticator app, then keeps watching the session. It works
+A WireGuard VPN client for Windows 10 and 11, and macOS 11 or later ([below](#macos)), in one app: it connects the
+tunnel and, for the servers that require it, logs in with username, password and the code of an authenticator app,
+then keeps watching the session. It works
 with the WireGuard servers of a NethSecurity firewall that use the login of
 [ns-wgauth](https://github.com/phatdo1819/nethsecurity/tree/ci-wgauth/packages/ns-wgauth), and with any other
 WireGuard server, without a login.
+
+> [!WARNING]
+> **This project was written by an AI** (Claude, by Anthropic), directed and tested by one person. No security
+> expert has reviewed it, and it hasn't been tested against a real NethSecurity server yet. A VPN client handles
+> your traffic and your passwords: read the code before you trust it, and use it at your own risk.
+
+To set up the firewall side and test both together, follow
+[WGAUTH-TESTING.md](https://github.com/phatdo1819/nethsecurity/blob/ci-wgauth/WGAUTH-TESTING.md) on the
+`ci-wgauth` branch of the NethSecurity fork: steps 1–7 for the login, step 8 for the fallback addresses.
 
 All the names of the app are in [src/product.rs](src/product.rs), and the name of the exe is in
 [Cargo.toml](Cargo.toml): to rename it, change them there.
@@ -113,8 +123,15 @@ reg add "HKLM\SOFTWARE\Policies\Authway" /v AllowUserImport /t REG_DWORD /d 1 /f
   RFC 7748).
 - **The login**: the page is the `# Login = ...` line that the firewall writes in the configuration; without it the
   app looks for the page on the first address of the network of the tunnel, port 8181, then through the redirect of
-  port 80. The service refuses a configuration whose login page isn't reached through the tunnel, so the password
-  goes only through it. The app asks `/api/status` every 20 seconds while logged in, every second while connecting.
+  port 80. The app asks `/api/status` every 20 seconds while logged in, every second while connecting. The password
+  goes only through the tunnel:
+  - the login page is always an address of the routes of the tunnel (`AllowedIPs`): the service refuses a
+    `# Login` line out of them, the app never looks for the page out of them nor follows a redirect out of them, and
+    it forgets a page found on an earlier connection once a new configuration leaves it out;
+  - the requests go out only through the network adapter of the tunnel, whatever the routes of the computer say
+    (`IP_UNICAST_IF`, with the index the service gives): a more specific route of the local network, as a DHCP
+    server can push with option 121 ("TunnelVision", CVE-2024-3661), can't take them. A connection that comes from
+    an address that isn't one of the adapter is closed before anything is sent.
 - **The passwords** are in the Credential Manager of the user (`Authway/http://10.103.1.1:8181`), on this
   computer only, if the user checked "Remember my password".
 - **The pipe** lets the signed-in users read and write, not create another instance of it; the app checks that the
@@ -152,7 +169,13 @@ The `testing` feature makes a build for the tests only: the service runs as the 
 fake tunnels, its pipe, its keys in `HKCU\Software\Authway test` and its credentials have other names, so it never
 touches an installed app. The end-to-end test drove that build against the real code of the ns-wgauth daemon: import,
 login with a wrong password then the right one, the session ended by the server, the saved password, cancel, quit
-with logout, removal.
+with logout, removal, and a saved login page out of the routes, dropped.
+
+The way out of the login: the unit tests check that discovery never goes out of the routes, the redirect included,
+and that nothing is sent through another network adapter. On the real driver, two WireGuardNT adapters on 127.0.0.1
+played the tunnel and a local network that pushes a more specific route to the login page: a plain connection went
+out through the local network, the ones of the login of the app through the tunnel, as the counters of the driver
+showed.
 
 The fallback addresses: the unit tests replay the counters second by second (an answer, silence, keepalives only,
 names that can't be found). In the test build a fake server answers at any port but 9. In the run of that build,
@@ -165,20 +188,103 @@ The MSI package for ARM64 was tested as administrator on Windows 11: the x64 one
 and restarts of the service, two tunnels through the installed `wireguard.dll`, the steps for the apps as SYSTEM, an
 update that keeps the VPNs and restarts the app, and a removal that leaves nothing, the driver included.
 
+## macOS
+
+The same app for macOS 11 or later, Apple silicon and Intel in one package: the same menu, login window, details,
+fallback addresses and rules for the password, from the same code ([src/client](src/client),
+[src/manager.rs](src/manager.rs)); what differs is in [src/macos](src/macos).
+
+> [!IMPORTANT]
+> The macOS version is written and compiles for both processors, but it **hasn't run on a Mac yet**: expect bugs
+> on the first runs, and keep a way back to your usual network (`sudo …/uninstall.sh`).
+
+**For the users.** Open `authway-<version>-macos.pkg` and click **Continue**, **Install**: macOS asks for the
+password of an administrator, once. The icon is in the menu bar, and the app starts at every login; click the
+icon for the menu. Adding a VPN works as on Windows, and macOS asks for an administrator when the user isn't
+allowed. The notices are in the Notification Center: macOS asks once whether the app can show them.
+
+**For the administrators.**
+
+```
+sudo installer -pkg authway-0.1.0-macos.pkg -target /
+sudo /Applications/Authway.app/Contents/MacOS/authway --import ~/Downloads/office.conf --name "Office"
+sudo /Applications/Authway.app/Contents/MacOS/authway --remove "Office"
+sudo "/Library/Application Support/Authway/uninstall.sh"
+```
+
+- **Update**: install the new package over the old one. The VPNs are kept; the app of each user logs out, turns its
+  tunnels off and quits, then the service and the app of the user at the screen start again.
+- **Remove**: `uninstall.sh`, as above (it's also in [installer/macos](installer/macos)). It takes away the app,
+  the service, the VPNs, the logs, and the settings and passwords of every user; the saved passwords of a user who
+  isn't logged in stay in their locked keychain.
+- **Policies**: the same values as on Windows, in `/Library/Preferences/io.github.phatdo1819.authway.plist` or in
+  a configuration profile (MDM) for that domain, read again within 15 seconds:
+
+  ```
+  sudo defaults write /Library/Preferences/io.github.phatdo1819.authway AllowUserImport -bool true
+  sudo defaults write /Library/Preferences/io.github.phatdo1819.authway RememberPassword -bool false
+  ```
+
+**How it works on macOS.**
+
+```
+ the user                                   root (launchd)
+┌──────────────────────┐  Unix socket   ┌────────────────────────┐  control socket  ┌──────────────┐
+│ Authway.app          │◄──────────────►│ authway --service      │◄────────────────►│ wireguard-go │
+│ menu, login, details │  JSON, a line  │ /Library/Application   │  /var/run/       │ one per      │
+└──────────────────────┘                │ Support/Authway        │  wireguard/      │ tunnel, utun │
+                                        └────────────────────────┘                  └──────────────┘
+```
+
+- **The service** is a launchd daemon, as root, from a copy of the program in `/Library/Application Support/Authway`,
+  which only root can change: an administrator could replace `/Applications/Authway.app` without a password. It
+  listens on `/var/run/authway.sock`; the app checks that root owns the socket and answers on it. Only root, or every
+  user with `AllowUserImport`, can add and remove VPNs: the app asks macOS for an administrator and runs the same
+  `--import` as root.
+- **The tunnels** are `wireguard-go`, the WireGuard of WireGuard LLC in user space, as the WireGuard tools of macOS
+  use it: one process per tunnel on a free `utun` interface, configured through its control socket, never given the
+  keys on its command line. The service sets the addresses and the routes as `wg-quick` does (a default route as two
+  halves, the server kept out of the tunnel through the gateway of the network), and the DNS servers on every
+  network service, put back when the tunnel goes off, and at the start of the service after a crash. It looks at
+  them again when the network changes.
+- **The session of a tunnel** is the user who turned it on. macOS doesn't tell a service when a user logs out: the
+  app lists the tunnels at least every 10 seconds, and the service turns off the tunnels of a user whose app stopped
+  asking for 2 minutes.
+- **The login** goes only through the tunnel, as on Windows, with `IP_BOUND_IF` in place of `IP_UNICAST_IF`.
+- **The configurations** are files of root, `/Library/Application Support/Authway/tunnels/<name>.conf`, readable by
+  root only. **The passwords** are in the login keychain of the user, under `Authway/http://10.103.1.1:8181`.
+- **The logs**: `~/Library/Logs/Authway/client.log` for the app, `/Library/Logs/Authway/service.log` for the service
+  and `wireguard-go`. **Logs** in the menu opens them in Console.
+
+**Build**, on a Mac with the Command Line Tools of Xcode, Rust and Go 1.23.1 or later:
+
+```
+rustup target add aarch64-apple-darwin x86_64-apple-darwin
+tools/fetch-wireguard-go.sh      # wireguard-go from its source, checked, for both processors
+tools/dist-macos.sh              # dist/authway-<version>-macos.pkg
+```
+
+The package is signed ad hoc, which is enough for the Mac that builds it. For other Macs, sign it with the
+certificates of an Apple developer account (`SIGN_APP="Developer ID Application: ..."`, `SIGN_PKG="Developer ID
+Installer: ..."`) and notarize it, or Gatekeeper refuses the downloaded package. With ad-hoc signatures, macOS can ask
+once again for the saved passwords after an update: the keychain knows the app by its signature.
+
+**Tests**: `cargo test --features testing` on a Mac too. The test build runs the service as the user
+(`--service-console`, socket `/tmp/authway-test.sock`, data in `~/Library/Application Support/Authway test`) with fake
+tunnels; the test of the login on `127.0.0.2` needs `sudo ifconfig lo0 alias 127.0.0.2` first.
+
 ## Not done yet
 
 - Tested with a real NethSecurity server: not yet (the real driver only on 127.0.0.1).
-- Two findings of the security review of 2026-10-26, both about the password leaving the tunnel: a login page
-  that the app finds by itself (no `# Login` line) isn't checked against the routes of the tunnel, and the login
-  connections follow the routing table only, so a more specific route of the local network (DHCP option 121)
-  can take them.
+- macOS: never run on a Mac yet, see above.
 - No kill switch: when the tunnel is down, the traffic goes out of it; no block of the DNS outside of the tunnel.
-- The package and the exe aren't signed: SmartScreen warns when they're downloaded.
+- The packages and the programs aren't signed by a known publisher: SmartScreen and Gatekeeper warn when they're
+  downloaded.
 - No reconnection by itself at the sign-in, no tunnels per user, English only.
-- macOS, iOS and Android: not started.
+- iOS and Android: not started.
 
 ## Licenses
 
-The app is under the GPL 2.0 of [LICENSE](LICENSE), installed next to it as `LICENSE.txt`. `wireguard.dll` is under the license of WireGuard LLC in `wireguard-LICENSE.txt`, which allows to ship it unchanged
-next to an app that uses its API. "WireGuard" is a registered trademark of Jason A. Donenfeld: the app doesn't use it
-in its name.
+The app is under the MIT license of [LICENSE](LICENSE), installed next to it as `LICENSE.txt`. `wireguard.dll` is under the license of WireGuard LLC in `wireguard-LICENSE.txt`, which allows to ship it unchanged
+next to an app that uses its API. `wireguard-go` is under the MIT license, in `wireguard-go-LICENSE.txt` next to it
+on macOS. "WireGuard" is a registered trademark of Jason A. Donenfeld: the app doesn't use it in its name.

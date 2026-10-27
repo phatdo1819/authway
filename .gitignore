@@ -1,4 +1,4 @@
 /target/
 /dist/
-# downloaded by tools\fetch-wireguard.ps1
+# downloaded by tools\fetch-wireguard.ps1, built by tools/fetch-wireguard-go.sh
 /wireguard/
