@@ -26,6 +26,11 @@ pub fn machine_key() -> String {
     format!(r"SOFTWARE\{}{}", PRODUCT, suffix())
 }
 
+// the key of the device proof of a tunnel, see device.rs: "Authway device {GUID}" on Windows, a file name on macOS
+pub fn device_key(tunnel: &str) -> String {
+    format!("{}{} device {}", PRODUCT, suffix(), tunnel)
+}
+
 // set by the administrator, in HKEY_LOCAL_MACHINE
 pub fn policy_key() -> String {
     format!(r"SOFTWARE\Policies\{}", PRODUCT)

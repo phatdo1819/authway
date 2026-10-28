@@ -9,6 +9,8 @@
 pub mod api;
 pub mod client;
 pub mod conf;
+pub mod device;
+pub mod digest;
 pub mod failover;
 pub mod ipc;
 pub mod log;
@@ -22,6 +24,8 @@ pub mod x25519;
 // one file per system
 #[cfg_attr(target_os = "macos", path = "macos/creds.rs")]
 pub mod creds;
+#[cfg_attr(target_os = "macos", path = "macos/devkey.rs")]
+pub mod devkey;
 #[cfg_attr(target_os = "macos", path = "macos/net.rs")]
 pub mod net;
 #[cfg_attr(target_os = "macos", path = "macos/service.rs")]

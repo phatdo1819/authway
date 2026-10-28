@@ -72,6 +72,11 @@ pub fn is_installed_copy() -> bool {
     fs::canonicalize(app_exe()).is_ok_and(|installed| installed == exe)
 }
 
+// root, with sudo or a deployment tool: the keychain would be the one of root, not of the user
+pub fn is_system_account() -> bool {
+    unsafe { libc::geteuid() == 0 }
+}
+
 // 'it'\''s' for /bin/sh
 fn shell_quote(argument: &str) -> String {
     format!("'{}'", argument.replace('\'', r"'\''"))

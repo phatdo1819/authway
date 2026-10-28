@@ -1,6 +1,6 @@
 // The JSON API of the login page of ns-wgauth, reachable only through the tunnel:
-//   GET  /api/status   {"authenticated", "otp_required", "server", "user", "expires", "blocked", "no_user"}
-//   POST /api/login    {"username", "password", "otp"}
+//   GET  /api/status   {"authenticated", "otp_required", "server", "user", "expires", "blocked", "no_user", "device"}
+//   POST /api/login    {"username", "password", "otp", "device"}, "device" signed by the service, see device.rs
 //   POST /api/logout
 // Plain HTTP to an address of the tunnel, never through a proxy. The requests go out only through the network
 // adapter of the tunnel, `interface` (its index), and only to an address of its routes: the password never goes
@@ -14,6 +14,7 @@ use std::time::Duration;
 use serde_json::{Map, Value};
 
 use crate::conf::{Config, IpNet};
+use crate::device::Proof;
 use crate::{log, names, net};
 
 pub const DEFAULT_PORT: u16 = 8181;
@@ -87,11 +88,17 @@ pub struct ApiResult {
     // why the page couldn't be reached
     pub failure: Option<String>,
     pub location: Option<String>,
+    // nothing was sent, for a reason of this computer: the text for the user
+    pub local_error: Option<String>,
 }
 
 impl ApiResult {
     fn unreachable(failure: String) -> ApiResult {
         ApiResult { failure: Some(failure), ..ApiResult::default() }
+    }
+
+    pub fn local(failure: &str, text: &str) -> ApiResult {
+        ApiResult { failure: Some(failure.to_string()), local_error: Some(text.to_string()), ..ApiResult::default() }
     }
 
     // nginx answers some errors, 429 for example, with a page instead of JSON
@@ -100,7 +107,7 @@ impl ApiResult {
             Ok(Value::Object(data)) => data,
             _ => Map::new(),
         };
-        ApiResult { status, data, failure: None, location }
+        ApiResult { status, data, failure: None, location, local_error: None }
     }
 
     pub fn reached(&self) -> bool {
@@ -145,9 +152,30 @@ pub fn status(page: &Page, interface: u32) -> ApiResult {
     send("GET", page, interface, "/api/status", None, REQUEST_TIMEOUT)
 }
 
-pub fn login(page: &Page, interface: u32, username: &str, password: &str, otp: &str) -> ApiResult {
-    let body = serde_json::json!({ "username": username, "password": password, "otp": otp });
+pub fn login(
+    page: &Page,
+    interface: u32,
+    username: &str,
+    password: &str,
+    otp: &str,
+    device: Option<&Proof>,
+) -> ApiResult {
+    let mut body = serde_json::json!({ "username": username, "password": password, "otp": otp });
+    if let Some(device) = device {
+        body["device"] = serde_json::to_value(device).unwrap_or_default();
+    }
     send("POST", page, interface, "/api/login", Some(&body), REQUEST_TIMEOUT)
+}
+
+// What the status says of device binding: the challenge to sign and whether the machine ID is required, None when
+// the server doesn't require it
+pub fn device_challenge(status: &ApiResult) -> Option<(String, bool)> {
+    let device = status.data.get("device").and_then(Value::as_object)?;
+    if device.get("required").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let challenge = device.get("challenge").and_then(Value::as_str).unwrap_or("").to_string();
+    Some((challenge, device.get("machine_id").and_then(Value::as_bool).unwrap_or(false)))
 }
 
 pub fn logout(page: &Page, interface: u32, timeout: Option<Duration>) -> ApiResult {
@@ -446,7 +474,7 @@ mod tests {
         // through another network adapter, or one not known yet: nothing is sent
         let internet = net::best_interface(&"192.0.2.1:0".parse().unwrap()).filter(|&index| index != loopback);
         for interface in internet.into_iter().chain([0]) {
-            let result = login(&page, interface, "alice", "Secret,1234", "123456");
+            let result = login(&page, interface, "alice", "Secret,1234", "123456", None);
             assert!(!result.reached(), "{}: {}", interface, result);
         }
         thread::sleep(Duration::from_millis(200));

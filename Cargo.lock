@@ -7,6 +7,7 @@ name = "authway"
 version = "0.1.0"
 dependencies = [
  "block2",
+ "core-foundation",
  "dispatch2",
  "embed-resource",
  "libc",
@@ -16,6 +17,7 @@ dependencies = [
  "objc2-uniform-type-identifiers",
  "objc2-user-notifications",
  "security-framework",
+ "security-framework-sys",
  "serde",
  "serde_json",
  "windows-sys",

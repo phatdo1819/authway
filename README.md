@@ -14,7 +14,8 @@ WireGuard server, without a login.
 
 To set up the firewall side and test both together, follow
 [WGAUTH-TESTING.md](https://github.com/phatdo1819/nethsecurity/blob/ci-wgauth/WGAUTH-TESTING.md) on the
-`ci-wgauth` branch of the NethSecurity fork: steps 1–7 for the login, step 8 for the fallback addresses.
+`ci-wgauth` branch of the NethSecurity fork: steps 1–7 for the login, step 8 for the fallback addresses, step 9
+for device binding.
 
 All the names of the app are in [src/product.rs](src/product.rs), and the name of the exe is in
 [Cargo.toml](Cargo.toml): to rename it, change them there.
@@ -27,6 +28,10 @@ All the names of the app are in [src/product.rs](src/product.rs), and the name o
    and choose the `.conf` file of the administrator. The app saves it protected and offers to delete the file.
 3. **Connect**: the window asks for username, password and code while the tunnel comes up. The sixth digit of the
    code connects.
+
+When the server requires device binding, the first login enrolls this computer: the window says so. The VPN then
+works only on this computer, even for someone who has the file and the password. On a new computer, or after
+removing the VPN from the app, ask the administrator to allow a new device.
 
 When the session ends on the firewall (it expired, or the computer changed network), the window opens again with the
 username and the saved password: only the code is needed. **Cancel** or **Disconnect** turns the tunnel off; the
@@ -54,11 +59,34 @@ msiexec /x authway-0.1.0-x64.msi /qn
 - **Install**: the app starts at once for every user signed in, and at every sign-in after.
 - **Update**: install the new package over the old one: it replaces it, even at the same version. The VPNs are kept;
   the app of each user logs out, turns its tunnels off and quits, then starts again.
-- **Remove**: from **Settings > Apps**, or `msiexec /x`. It takes away the service, the VPNs, the logs and the
-  driver, and the settings and passwords of the user who removes it. Other users' saved passwords stay in their
-  Credential Manager.
+- **Remove**: from **Settings > Apps**, or `msiexec /x`. It takes away the service, the VPNs with their device keys,
+  the logs and the driver, and the settings and passwords of the user who removes it. Other users' saved passwords
+  stay in their Credential Manager.
+- **Device binding** (`device_binding` of a NethSecurity WireGuard server): the first login of each VPN enrolls this
+  computer, then only it can log in. An update keeps the keys; removing a VPN, or the app, deletes them, and the next
+  login needs a new enrollment, allowed on the firewall (**Allow a new device** in the menu of the peer). The
+  administrator of the firewall sees the computer name of each enrolled device.
 - The package is for x64 or ARM64 Windows 10 version 2004 or later, or Windows 11: it refuses the wrong computer.
   The folder is always `C:\Program Files\Authway`.
+
+**The login with the VPN.** `--import` can also save the username and password of the login page, as OpenVPN
+Connect does, so the login window is already filled in the first time (the user still clicks **Connect**, and types
+the code when the server asks for one):
+
+```
+"C:\Program Files\Authway\authway.exe" --import "C:\path\office.conf" --name "Office" --username "alice" --password "Secret,1234"
+```
+
+- `--username=alice` and `--password=...` work too. `--username` alone saves only the username.
+- The login is saved in the Credential Manager of **the user who runs the command**, for the login page of the
+  file (its `# Login =` line; a file without one is refused), as **Remember my password** saves it. So run it as
+  that user, not as SYSTEM, which is refused: when the user isn't allowed to add VPNs, the command asks for an
+  administrator for the VPN only, and the login stays with the user. For a deployment tool that runs scripts as the
+  user, install with `ALLOWUSERIMPORT=1`, below, so no permission is asked.
+- With the policy `RememberPassword` = 0 the command refuses `--password`.
+- A password on a command line can end up in the history of the shell, in the logs of the deployment tool, or in
+  the process auditing of Windows when it's on: prefer having users type it once and check **Remember my
+  password**, and change the password after a deployment that might have logged it.
 
 **Who can add and remove VPNs.** By default only an administrator: a VPN can route all the traffic of the computer
 and change its DNS, so a user who isn't one sees the permission of Windows when adding or removing a VPN. Any user
@@ -132,6 +160,17 @@ reg add "HKLM\SOFTWARE\Policies\Authway" /v AllowUserImport /t REG_DWORD /d 1 /f
     (`IP_UNICAST_IF`, with the index the service gives): a more specific route of the local network, as a DHCP
     server can push with option 121 ("TunnelVision", CVE-2024-3661), can't take them. A connection that comes from
     an address that isn't one of the adapter is closed before anything is sent.
+- **Device binding**: a server can accept the login only from the device enrolled for the configuration
+  (`device_binding` of ns-wgauth). The status of the login page then gives a challenge; the app asks the service to
+  sign it, with the address of the computer in the VPN, the keys of both sides and the user name, and sends the
+  signature with the login ([src/device.rs](src/device.rs)). The service keeps one ECDSA P-256 key for each tunnel,
+  made at the first such login: on Windows in the Microsoft Software Key Storage Provider, a key of the computer
+  that can't be exported and only SYSTEM and the administrators can use ([src/devkey.rs](src/devkey.rs)); on macOS
+  in a file readable by root only. The first login enrolls the key; then a copy of the configuration, even with the
+  password, doesn't work on another computer. When the server asks for the machine ID too, the service adds an
+  HMAC of the hardware ID of the computer (SMBIOS UUID, else `MachineGuid`; `IOPlatformUUID` on macOS), keyed with
+  the public key of the server, so the server never sees the ID. Removing the VPN removes its key: added again, it
+  needs a new enrollment, which the administrator allows.
 - **The passwords** are in the Credential Manager of the user (`Authway/http://10.103.1.1:8181`), on this
   computer only, if the user checked "Remember my password".
 - **The pipe** lets the signed-in users read and write, not create another instance of it; the app checks that the
@@ -184,6 +223,12 @@ On the real driver, two WireGuardNT adapters on 127.0.0.1 were used, the Endpoin
 - the switch came after 21 seconds, and the handshake at the next retry of the driver, 5 seconds later;
 - the tunnel stayed there for 2 minutes of unanswered keepalives, then the rekey.
 
+Device binding: the unit tests check SHA-256 and HMAC-SHA256 with the published vectors, the DER of the signatures,
+the message, the SMBIOS UUID (byte order, placeholders) and a real key of the Microsoft Software Key Storage
+Provider, whose signature `openssl dgst -verify` accepts, as the firewall does. A proof made by `device::prove` was
+also accepted by the `verify_device` of the firewall, and refused with another user, address or server. Not tested
+yet: against a real firewall, and the key of macOS.
+
 The MSI package for ARM64 was tested as administrator on Windows 11: the x64 one refused, the install, the rights
 and restarts of the service, two tunnels through the installed `wireguard.dll`, the steps for the apps as SYSTEM, an
 update that keeps the VPNs and restarts the app, and a removal that leaves nothing, the driver included.
@@ -211,6 +256,15 @@ sudo /Applications/Authway.app/Contents/MacOS/authway --import ~/Downloads/offic
 sudo /Applications/Authway.app/Contents/MacOS/authway --remove "Office"
 sudo "/Library/Application Support/Authway/uninstall.sh"
 ```
+
+- **With the login**, as on Windows: `--username` and `--password` save it in the keychain of the user who runs the
+  command, so run it **without sudo**, as that user: macOS asks for an administrator for the VPN only, when the user
+  isn't allowed. As root it's refused. On macOS any user can see the command lines of running programs with `ps`,
+  for the moment the command runs.
+
+  ```
+  /Applications/Authway.app/Contents/MacOS/authway --import ~/Downloads/office.conf --name "Office" --username "alice" --password "Secret,1234"
+  ```
 
 - **Update**: install the new package over the old one. The VPNs are kept; the app of each user logs out, turns its
   tunnels off and quits, then the service and the app of the user at the screen start again.
@@ -253,6 +307,9 @@ sudo "/Library/Application Support/Authway/uninstall.sh"
 - **The login** goes only through the tunnel, as on Windows, with `IP_BOUND_IF` in place of `IP_UNICAST_IF`.
 - **The configurations** are files of root, `/Library/Application Support/Authway/tunnels/<name>.conf`, readable by
   root only. **The passwords** are in the login keychain of the user, under `Authway/http://10.103.1.1:8181`.
+- **The device keys** of device binding are P-256 keys made by the Security framework, in
+  `/Library/Application Support/Authway/devices/<name>.key`, readable by root only; the machine ID is the
+  `IOPlatformUUID` of the Mac. Not in the Secure Enclave yet.
 - **The logs**: `~/Library/Logs/Authway/client.log` for the app, `/Library/Logs/Authway/service.log` for the service
   and `wireguard-go`. **Logs** in the menu opens them in Console.
 
@@ -281,6 +338,7 @@ tunnels; the test of the login on `127.0.0.2` needs `sudo ifconfig lo0 alias 127
 - The packages and the programs aren't signed by a known publisher: SmartScreen and Gatekeeper warn when they're
   downloaded.
 - No reconnection by itself at the sign-in, no tunnels per user, English only.
+- Device binding: software keys only, not in the TPM or the Secure Enclave.
 - iOS and Android: not started.
 
 ## Licenses

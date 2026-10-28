@@ -15,7 +15,8 @@ use objc2_uniform_type_identifiers::UTType;
 
 use super::{activate, alert, error_alert, ns, with_app};
 use crate::api;
-use crate::client::import::{load, name_for};
+use crate::client::import::{load, login_page, name_for, Login};
+use crate::creds;
 use crate::ipc::{self, CallError, Request};
 use crate::log;
 use crate::names::PRODUCT;
@@ -148,26 +149,45 @@ fn ready_dialog(mtm: MainThreadMarker, name: &str, file: &str) -> (bool, bool) {
     (connect, delete.is_some_and(|button| button.state() == NSControlStateValueOn))
 }
 
-// --import <file> --name <name> [--replace], as root: the errors go to the app through osascript
-pub fn import_command(path: &Path, name: &str, replace: bool) -> i32 {
-    let (text, _) = match load(path) {
-        Ok(loaded) => loaded,
-        Err(message) => {
-            eprintln!("{}", message);
-            return 1;
-        }
+// --import <file> --name <name> [--replace], as root: the errors go to the app through osascript. With
+// [--username <username> [--password <password>]], as the user of the VPN, without sudo: the login goes in their
+// keychain, and only the import asks for an administrator, when they aren't allowed
+pub fn import_command(path: &Path, name: &str, replace: bool, login: Option<&Login>) -> i32 {
+    let fail = |message: &str| {
+        eprintln!("{}", message);
+        1
     };
-    match ipc::call(&Request::Import { name: name.to_string(), config: text, replace }) {
-        Ok(response) if response.ok => 0,
-        Ok(response) => {
-            eprintln!("{}", strings::import_invalid(response.message()));
-            1
+    let (text, config) = match load(path) {
+        Ok(loaded) => loaded,
+        Err(message) => return fail(&message),
+    };
+    let page = match login {
+        Some(_) if setup::is_system_account() => return fail(strings::IMPORT_LOGIN_SYSTEM),
+        Some(login) => match login_page(&config, login) {
+            Ok(page) => Some(page),
+            Err(message) => return fail(&message),
+        },
+        None => None,
+    };
+    match ipc::call(&Request::Import { name: name.to_string(), config: text.clone(), replace }) {
+        Ok(response) if response.ok => {}
+        Ok(response) if response.error_code() == ipc::ACCESS_DENIED && login.is_some() => {
+            match import_as_admin(&text, name, replace) {
+                Ok(()) => {}
+                Err(error) if error == CANCELLED => return 1,
+                Err(error) => return fail(&error),
+            }
         }
-        Err(error) => {
-            eprintln!("{}", call_text(&error));
-            1
-        }
+        Ok(response) => return fail(&strings::import_invalid(response.message())),
+        Err(error) => return fail(&call_text(&error)),
     }
+    if let (Some(page), Some(login)) = (page, login) {
+        if !creds::save(&page, &login.username, login.password.as_deref()) {
+            return fail(&strings::import_login_not_saved(name, creds::STORE_NAME));
+        }
+        log!("{}: login of {} saved from the command line", name, login.username);
+    }
+    0
 }
 
 pub fn remove(mtm: MainThreadMarker, name: &str) {

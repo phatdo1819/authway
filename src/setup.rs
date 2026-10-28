@@ -13,6 +13,7 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_ACCESS_DENIED, ERROR_CANCELLED, ERROR_NO_TOKEN, ERROR_SERVICE_ALREADY_RUNNING, HANDLE, HWND,
     WAIT_OBJECT_0,
 };
+use windows_sys::Win32::Security::{CheckTokenMembership, CreateWellKnownSid, WinLocalSystemSid};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
@@ -72,6 +73,18 @@ pub fn is_installed_copy() -> bool {
 
 pub fn quote(argument: &str) -> String {
     format!("\"{}\"", argument)
+}
+
+// SYSTEM, as a deployment tool runs the commands: it has no Credential Manager of a user
+pub fn is_system_account() -> bool {
+    let mut sid = [0u8; 68];
+    let mut size = sid.len() as u32;
+    let mut member = 0;
+    unsafe {
+        CreateWellKnownSid(WinLocalSystemSid, ptr::null_mut(), sid.as_mut_ptr() as _, &mut size) != 0
+            && CheckTokenMembership(ptr::null_mut(), sid.as_mut_ptr() as _, &mut member) != 0
+            && member != 0
+    }
 }
 
 pub const CANCELLED: &str = "cancelled";
@@ -318,11 +331,15 @@ pub fn start_apps() {
     }
 }
 
-// --msi-remove-data, as SYSTEM when the app is removed, not updated: the tunnels, the logs and the driver, which
-// stays while another app uses it
+// --msi-remove-data, as SYSTEM when the app is removed, not updated: the tunnels with their device keys, the logs
+// and the driver, which stays while another app uses it
 pub fn remove_data() {
     if let Ok(wireguard) = crate::wg::WireGuard::load() {
         let _ = wireguard.delete_driver();
+    }
+    // the keys are kept by Windows, out of the registry of the app
+    for stored in crate::store::list() {
+        crate::devkey::delete(&stored.name, &stored.id);
     }
     let _ = reg::delete_tree(reg::HKEY_LOCAL_MACHINE, &names::machine_key());
     let _ = fs::remove_dir_all(install_dir().join("log"));

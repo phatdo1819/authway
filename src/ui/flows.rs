@@ -23,7 +23,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use super::tray::{running, signal, with_app};
 use super::{instance, message_box};
 use crate::api;
-use crate::client::import::{load, name_for};
+use crate::client::import::{load, login_page, name_for, Login};
+use crate::creds;
 use crate::ipc::{self, CallError, Request};
 use crate::log;
 use crate::names;
@@ -112,11 +113,7 @@ pub fn import_path(owner: HWND, path: &Path) {
         Ok(response) if response.ok => {}
         Ok(response) if response.error_code() == ipc::ACCESS_DENIED => {
             // the same steps, as administrator
-            let mut arguments = format!("--import {} --name {}", quote(&path.display().to_string()), quote(&name));
-            if replace {
-                arguments += " --replace";
-            }
-            match setup::elevate(&arguments, owner) {
+            match setup::elevate(&admin_import(path, &name, replace), owner) {
                 Ok(0) => {}
                 Ok(_) => return,
                 Err(error) if error == CANCELLED => return,
@@ -175,26 +172,56 @@ fn ready_dialog(owner: HWND, name: &str, file: &str) -> (bool, bool) {
     (button == BUTTON_CONNECT, checked != 0)
 }
 
-// --import <file> --name <name> [--replace], as administrator
-pub fn import_command(path: &Path, name: &str, replace: bool) -> i32 {
-    let (text, _) = match load(path) {
+// the import as administrator: never with the login, which stays with the user
+fn admin_import(path: &Path, name: &str, replace: bool) -> String {
+    let mut arguments = format!("--import {} --name {}", quote(&path.display().to_string()), quote(name));
+    if replace {
+        arguments += " --replace";
+    }
+    arguments
+}
+
+// --import <file> --name <name> [--replace], as administrator. With [--username <username> [--password
+// <password>]], as the user of the VPN: the login goes in their Credential Manager, and only the import asks for an
+// administrator, when they aren't allowed
+pub fn import_command(path: &Path, name: &str, replace: bool, login: Option<&Login>) -> i32 {
+    let fail = |message: &str| {
+        error_box(ptr::null_mut(), message);
+        1
+    };
+    let (text, config) = match load(path) {
         Ok(loaded) => loaded,
-        Err(message) => {
-            error_box(ptr::null_mut(), &message);
-            return 1;
-        }
+        Err(message) => return fail(&message),
+    };
+    let page = match login {
+        Some(_) if setup::is_system_account() => return fail(strings::IMPORT_LOGIN_SYSTEM),
+        Some(login) => match login_page(&config, login) {
+            Ok(page) => Some(page),
+            Err(message) => return fail(&message),
+        },
+        None => None,
     };
     match ipc::call(&Request::Import { name: name.to_string(), config: text, replace }) {
-        Ok(response) if response.ok => 0,
-        Ok(response) => {
-            error_box(ptr::null_mut(), &strings::import_invalid(response.message()));
-            1
+        Ok(response) if response.ok => {}
+        Ok(response) if response.error_code() == ipc::ACCESS_DENIED && login.is_some() => {
+            match setup::elevate(&admin_import(path, name, replace), ptr::null_mut()) {
+                Ok(0) => {}
+                // it said why
+                Ok(code) => return code as i32,
+                Err(error) if error == CANCELLED => return 1,
+                Err(error) => return fail(&error),
+            }
         }
-        Err(error) => {
-            error_box(ptr::null_mut(), &call_text(&error));
-            1
-        }
+        Ok(response) => return fail(&strings::import_invalid(response.message())),
+        Err(error) => return fail(&call_text(&error)),
     }
+    if let (Some(page), Some(login)) = (page, login) {
+        if !creds::save(&page, &login.username, login.password.as_deref()) {
+            return fail(&strings::import_login_not_saved(name, creds::STORE_NAME));
+        }
+        log!("{}: login of {} saved from the command line", name, login.username);
+    }
+    0
 }
 
 pub fn remove(owner: HWND, name: &str) {

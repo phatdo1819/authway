@@ -42,6 +42,15 @@ pub enum Request {
     Down { name: String },
     Import { name: String, config: String, #[serde(default)] replace: bool },
     Remove { name: String },
+    // the device proof of a login on the page at `host`, see device.rs
+    Sign {
+        name: String,
+        host: std::net::Ipv4Addr,
+        challenge: String,
+        username: String,
+        #[serde(default)]
+        machine_id: bool,
+    },
 }
 
 // the errors of the service
@@ -61,6 +70,9 @@ pub struct Response {
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tunnels: Vec<TunnelInfo>,
+    // the answer to Sign
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<crate::device::Proof>,
     // whether the user who asked can add and remove tunnels without asking to be administrator
     #[serde(default)]
     pub can_manage: bool,

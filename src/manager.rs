@@ -1,7 +1,7 @@
 // The tunnels of the service, the same on every system: their configurations, the ones that are on and the
 // fallbacks of their servers. Each system turns the tunnels on with its Engine, and talks with the app its own way.
 
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::thread;
@@ -14,6 +14,7 @@ use crate::ipc::{self, PeerInfo, Request, Response, TunnelInfo};
 use crate::log;
 use crate::store;
 use crate::time::unix_now;
+use crate::{device, devkey};
 
 // What the tunnel says of a server
 pub struct PeerStats {
@@ -223,6 +224,7 @@ impl Manager {
         drop(entry.active);
         match store::delete(&entry.name) {
             Ok(()) => {
+                devkey::delete(&entry.name, &entry.id);
                 log!("{}: removed", entry.name);
                 Response::success()
             }
@@ -340,6 +342,26 @@ impl Manager {
                     return denied();
                 }
                 self.remove(&name)
+            }
+            Request::Sign { name, host, challenge, username, machine_id } => {
+                self.sign(&name, host, &challenge, &username, machine_id)
+            }
+        }
+    }
+
+    // the device proof of a login, for a tunnel that's on
+    fn sign(&mut self, name: &str, host: Ipv4Addr, challenge: &str, username: &str, machine_id: bool) -> Response {
+        let Some(entry) = self.find(name) else {
+            return Response::failure(ipc::NOT_FOUND, format!("There's no VPN named {}.", name));
+        };
+        if entry.active.is_none() {
+            return Response::failure(ipc::INVALID, format!("{} isn't connected.", entry.name));
+        }
+        match device::prove(&entry.name, &entry.id, &entry.config, host, challenge, username, machine_id) {
+            Ok(proof) => Response { ok: true, device: Some(proof), ..Response::default() },
+            Err(error) => {
+                log!("{}: can't sign the login: {}", entry.name, error);
+                Response::failure(ipc::FAILED, format!("This computer can't sign the login: {}.", error))
             }
         }
     }

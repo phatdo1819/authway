@@ -286,16 +286,23 @@ pub fn parse_key(text: &str) -> Option<Key> {
 }
 
 pub fn encode_key(key: &Key) -> String {
+    base64(key)
+}
+
+// Standard base64, with padding
+pub fn base64(data: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut text = String::with_capacity(44);
-    for chunk in key.chunks(3) {
+    let mut text = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
         let bytes = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
         let value = (bytes[0] as u32) << 16 | (bytes[1] as u32) << 8 | bytes[2] as u32;
         for i in 0..=chunk.len() {
             text.push(ALPHABET[(value >> (18 - 6 * i) & 63) as usize] as char);
         }
+        for _ in chunk.len()..3 {
+            text.push('=');
+        }
     }
-    text.push('=');
     text
 }
 

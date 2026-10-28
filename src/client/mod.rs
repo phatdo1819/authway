@@ -49,6 +49,8 @@ pub enum Session {
     Blocked,
     NoUser,
     NoOtp,
+    // device binding: no device enrolled, and none can enroll
+    NotEnrolled,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -68,6 +70,8 @@ pub struct Tunnel {
     pub otp_required: bool,
     // whether a status said it
     pub otp_known: bool,
+    // device binding: the next login enrolls this computer
+    pub enrolling: bool,
     pub user: String,
     pub expires: u64,
     pub next_check: Instant,
@@ -100,6 +104,7 @@ impl Tunnel {
             server_name: String::new(),
             otp_required: true,
             otp_known: false,
+            enrolling: false,
             user: String::new(),
             expires: 0,
             next_check: now,
@@ -228,6 +233,7 @@ impl Tunnel {
             Session::Blocked => strings::STATE_BLOCKED.to_string(),
             Session::NoUser => strings::STATE_NO_USER.to_string(),
             Session::NoOtp => strings::STATE_NO_OTP.to_string(),
+            Session::NotEnrolled => strings::STATE_NOT_ENROLLED.to_string(),
         }
     }
 
@@ -246,7 +252,7 @@ impl Tunnel {
             return if self.info.handshake > 0 { Icon::Connected } else { Icon::Attention };
         }
         match self.session {
-            Session::Blocked | Session::NoUser | Session::NoOtp => Icon::Refused,
+            Session::Blocked | Session::NoUser | Session::NoOtp | Session::NotEnrolled => Icon::Refused,
             Session::LoggedIn | Session::NotRequired => Icon::Connected,
             _ => Icon::Attention,
         }
@@ -268,6 +274,7 @@ fn refusal(error: &str) -> Option<(Session, &'static str)> {
         "blocked" => Some((Session::Blocked, strings::ERROR_BLOCKED)),
         "no_user" => Some((Session::NoUser, strings::ERROR_NO_USER)),
         "no_otp" => Some((Session::NoOtp, strings::ERROR_NO_OTP)),
+        "device_not_enrolled" => Some((Session::NotEnrolled, strings::ERROR_NOT_ENROLLED)),
         _ => None,
     }
 }
@@ -277,8 +284,48 @@ fn refusal_text(session: Session) -> Option<&'static str> {
         Session::Blocked => Some(strings::ERROR_BLOCKED),
         Session::NoUser => Some(strings::ERROR_NO_USER),
         Session::NoOtp => Some(strings::ERROR_NO_OTP),
+        Session::NotEnrolled => Some(strings::ERROR_NOT_ENROLLED),
         _ => None,
     }
+}
+
+// What a status says of device binding: whether no device can log in, and whether the next login enrolls this one
+fn device_state(result: &ApiResult) -> (bool, bool) {
+    let Some(device) = result.data.get("device").and_then(serde_json::Value::as_object) else {
+        return (false, false);
+    };
+    let flag = |key: &str| device.get(key).and_then(serde_json::Value::as_bool).unwrap_or(false);
+    let open = flag("required") && !flag("enrolled");
+    (open && !flag("enrollment_open"), open && flag("enrollment_open"))
+}
+
+// A login, with the proof of this device when the server requires it: the challenge of a new status, signed by the
+// service. Once more with a new challenge if it expired meanwhile.
+fn log_in(tunnel: &str, page: &Page, interface: u32, username: &str, password: &str, code: &str) -> ApiResult {
+    let mut result = ApiResult::default();
+    for _ in 0..2 {
+        let status = api::status(page, interface);
+        let Some((challenge, machine_id)) = api::device_challenge(&status) else {
+            return api::login(page, interface, username, password, code, None);
+        };
+        let request = Request::Sign {
+            name: tunnel.to_string(),
+            host: page.host,
+            challenge,
+            username: username.to_string(),
+            machine_id,
+        };
+        let proof = match ipc::call(&request) {
+            Ok(response) if response.ok && response.device.is_some() => response.device,
+            Ok(response) => return ApiResult::local(response.message(), strings::ERROR_DEVICE_REQUIRED),
+            Err(error) => return ApiResult::local(&call_message(&error), &call_message(&error)),
+        };
+        result = api::login(page, interface, username, password, code, proof.as_ref());
+        if !(result.status == 401 && result.error() == "challenge_expired") {
+            break;
+        }
+    }
+    result
 }
 
 pub enum Event {
@@ -414,9 +461,21 @@ pub struct App<S: Shell> {
 }
 
 pub fn error_message(result: &ApiResult) -> String {
+    if let Some(text) = &result.local_error {
+        return text.clone();
+    }
     if !result.reached() {
         return strings::ERROR_UNREACHABLE.to_string();
     }
+    match (result.status, result.error()) {
+        (401, "device_mismatch") => strings::ERROR_DEVICE_MISMATCH.to_string(),
+        (401, "challenge_expired") => strings::ERROR_FAILED.to_string(),
+        (403, "device_required") => strings::ERROR_DEVICE_REQUIRED.to_string(),
+        _ => match_status(result),
+    }
+}
+
+fn match_status(result: &ApiResult) -> String {
     match result.status {
         401 => strings::ERROR_CREDENTIALS.to_string(),
         // nginx answers too many requests without retry_after
@@ -866,7 +925,12 @@ impl<S: Shell> App<S> {
                 }
                 tunnel.otp_required = result.get_bool("otp_required");
                 tunnel.otp_known = true;
-                let refused = ["blocked", "no_user", "no_otp"].into_iter().find(|key| result.get_bool(key));
+                let (not_enrolled, enrolling) = device_state(&result);
+                tunnel.enrolling = enrolling;
+                let refused = ["blocked", "no_user", "no_otp"]
+                    .into_iter()
+                    .find(|key| result.get_bool(key))
+                    .or(not_enrolled.then_some("device_not_enrolled"));
                 if result.get_bool("authenticated") {
                     set_logged_in(tunnel, result.get_str("user"), result.get_str("expires"), now);
                     close_window = true;
@@ -913,6 +977,9 @@ impl<S: Shell> App<S> {
                     window.view.set_heading(&tunnel.title());
                     window.view.set_otp_required(tunnel.otp_required);
                     window.view.set_hint(if tunnel.otp_required { strings::LOGIN_HINT_OTP } else { strings::LOGIN_HINT });
+                    if tunnel.enrolling {
+                        window.view.set_notice(Some(strings::NOTICE_ENROLL));
+                    }
                     if window.pending_submit {
                         submit = true;
                     } else {
@@ -1063,7 +1130,7 @@ impl<S: Shell> App<S> {
             saved: &saved,
             can_remember: settings::can_remember_password(),
             otp_required: tunnel.otp_required,
-            notice,
+            notice: notice.or(tunnel.enrolling.then_some(strings::NOTICE_ENROLL)),
         };
         if let Some(mut view) = self.shell.open_login(form) {
             view.set_error(refused);
@@ -1126,7 +1193,7 @@ impl<S: Shell> App<S> {
         let name = name.to_string();
         let (username, password, remember) = (values.username, values.password, values.remember);
         self.spawn(move || {
-            let result = api::login(&page, interface, &username, &password, &code);
+            let result = log_in(&name, &page, interface, &username, &password, &code);
             Event::Login { name, generation, result, username, password, remember }
         });
     }

@@ -13,6 +13,7 @@ pub const STATE_NEED_LOGIN: &str = "waiting for the login";
 pub const STATE_BLOCKED: &str = "configuration blocked";
 pub const STATE_NO_USER: &str = "configuration not linked to a user";
 pub const STATE_NO_OTP: &str = "codes of the user not set up";
+pub const STATE_NOT_ENROLLED: &str = "no device enrolled";
 
 pub fn state_logged_in(user: &str, until: &str) -> String {
     format!("connected as {} until {}", user, until)
@@ -67,6 +68,14 @@ pub const ERROR_UNREACHABLE: &str = "Can't reach the login page. Check your inte
 pub const ERROR_NO_ANSWER: &str =
     "The VPN server doesn't answer. Check your internet connection, or ask your administrator.";
 pub const ERROR_FAILED: &str = "The login didn't work. Try again in a moment.";
+// with device binding
+pub const ERROR_NOT_ENROLLED: &str = "No device is enrolled for this VPN configuration, and a new one can't enroll. \
+                                      Contact your administrator.";
+pub const ERROR_DEVICE_MISMATCH: &str = "This VPN configuration is enrolled on another device: it works only there. \
+                                         Contact your administrator to use it on this computer.";
+pub const ERROR_DEVICE_REQUIRED: &str = "This VPN requires a login signed by the enrolled device, and this one \
+                                         couldn't be signed. Try again, or contact your administrator.";
+pub const NOTICE_ENROLL: &str = "Your first login enrolls this computer: then this VPN works only here.";
 pub const ERROR_MISSING: &str = "Enter your username and password.";
 pub const ERROR_MISSING_OTP: &str = "Enter the 6-digit code of your authenticator app.";
 
@@ -152,6 +161,19 @@ pub fn import_ready(name: &str) -> String {
 
 pub fn import_delete_file(file: &str) -> String {
     format!("Delete the file {}: it isn't needed anymore", file)
+}
+
+// --import with --username and --password
+pub const IMPORT_LOGIN_NO_PAGE: &str = "This configuration has no login page (no \"# Login =\" line), so there's no \
+                                        login to save: leave out --username and --password.";
+pub const IMPORT_LOGIN_NO_REMEMBER: &str = "The policy RememberPassword = 0 of this computer doesn't let the app save \
+                                            passwords: leave out --password, the username alone can be saved.";
+pub const IMPORT_LOGIN_SYSTEM: &str = "The username and password are saved for the account that runs this command, \
+                                       and this one is the system's, not a user's: run it as the user of the VPN, \
+                                       who's asked for an administrator when needed.";
+
+pub fn import_login_not_saved(name: &str, store: &str) -> String {
+    format!("{} is added, but its login couldn't be saved in {}.", name, store)
 }
 
 pub fn remove_confirm(name: &str) -> String {
