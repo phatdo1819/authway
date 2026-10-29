@@ -8,7 +8,7 @@ use std::thread;
 use std::time::Instant;
 
 use crate::api::Page;
-use crate::conf::{self, Config};
+use crate::conf::{self, Config, IpNet};
 use crate::failover::{self, Failover, Next, Poll};
 use crate::ipc::{self, PeerInfo, Request, Response, TunnelInfo};
 use crate::log;
@@ -34,12 +34,16 @@ pub trait Tunnel: Send {
     fn interface(&self) -> u32;
     // another address for a server, a fallback
     fn set_endpoint(&mut self, public_key: &conf::Key, address: SocketAddr) -> Result<(), String>;
+    // the routes and the DNS servers of Steps::after on, or off again
+    fn after_login(&mut self, _on: bool) -> Result<(), String> {
+        Ok(())
+    }
     // now and then, while it's on: what the system doesn't keep by itself, after a change of network
     fn upkeep(&mut self) {}
 }
 
-// How the system turns a tunnel on, with the address of each server: None for one without Endpoint. The tunnel goes
-// off when it's dropped.
+// How the system turns a tunnel on, with the address of each server: None for one without Endpoint, and the routes
+// of Steps::before. The tunnel goes off when it's dropped.
 pub trait Engine: Send {
     fn start(
         &mut self,
@@ -47,7 +51,33 @@ pub trait Engine: Send {
         id: &store::Id,
         config: &Config,
         endpoints: &[Option<SocketAddr>],
+        steps: &Steps,
     ) -> Result<Box<dyn Tunnel>, String>;
+}
+
+// The routes of a tunnel, in two steps when its server requires a login. Before the login: its private networks and
+// the login page, without the DNS servers, which would answer only for the login page; the internet goes on through
+// the network of the computer, as without the VPN. With the login: the routes to the internet and the DNS servers.
+// A tunnel without a login has all of them at once.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Steps {
+    pub before: Vec<IpNet>,
+    pub after: Vec<IpNet>,
+    // the DNS servers wait for the login
+    pub dns_after: bool,
+}
+
+pub fn steps(config: &Config) -> Steps {
+    let routes = config.routes();
+    let page = config.login.as_deref().and_then(Page::parse).filter(|page| config.routes_to(page.host.into()));
+    let Some(page) = page else {
+        return Steps { before: routes, after: Vec::new(), dns_after: false };
+    };
+    let (mut before, after): (Vec<IpNet>, Vec<IpNet>) = routes.into_iter().partition(IpNet::is_private);
+    if !before.iter().any(|net| net.contains(page.host.into())) {
+        before.push(IpNet { addr: page.host.into(), prefix: 32 });
+    }
+    Steps { before, after, dns_after: true }
 }
 
 struct Active {
@@ -59,6 +89,8 @@ struct Active {
     id: u64,
     // for each server of the configuration, None for one without Endpoint
     failovers: Vec<Option<Failover>>,
+    // the routes and the DNS servers of after the login are on
+    logged_in: bool,
 }
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -131,16 +163,21 @@ impl Manager {
         if entry.active.is_some() {
             return Response::success();
         }
+        let steps = steps(&entry.config);
         let started = resolve(&entry.name, &entry.config).and_then(|failovers| {
             let endpoints: Vec<Option<SocketAddr>> =
                 failovers.iter().map(|failover| failover.as_ref().map(Failover::address)).collect();
-            let tunnel = self.engine.start(&entry.name, &entry.id, &entry.config, &endpoints)?;
+            let tunnel = self.engine.start(&entry.name, &entry.id, &entry.config, &endpoints, &steps)?;
             Ok((tunnel, failovers))
         });
         match started {
             Ok((tunnel, failovers)) => {
                 log!("{}: on, for the session {}", entry.name, session);
-                entry.active = Some(Active { tunnel, since: unix_now(), session, id: next_id(), failovers });
+                if steps.dns_after {
+                    log!("{}: the routes to the internet and the DNS servers wait for the login", entry.name);
+                }
+                let id = next_id();
+                entry.active = Some(Active { tunnel, since: unix_now(), session, id, failovers, logged_in: false });
                 Response::success()
             }
             Err(error) => {
@@ -229,6 +266,65 @@ impl Manager {
                 Response::success()
             }
             Err(error) => Response::failure(ipc::FAILED, format!("Can't remove the configuration: {}.", error)),
+        }
+    }
+
+    // only while it's off: the app knows the tunnels that are on by their names
+    fn rename(&mut self, name: &str, new_name: &str) -> Response {
+        if !conf::is_valid_name(new_name) {
+            return Response::failure(ipc::INVALID, format!("\"{}\" can't be the name of a VPN.", new_name));
+        }
+        let Some(index) = self.entries.iter().position(|entry| entry.name.eq_ignore_ascii_case(name)) else {
+            return Response::failure(ipc::NOT_FOUND, format!("There's no VPN named {}.", name));
+        };
+        let taken = self.entries.iter().enumerate().any(|(other, entry)| other != index && entry.name.eq_ignore_ascii_case(new_name));
+        if taken {
+            return Response::failure(ipc::EXISTS, format!("There's already a VPN named {}.", new_name));
+        }
+        let entry = &mut self.entries[index];
+        if entry.name == new_name {
+            return Response::success();
+        }
+        if entry.active.is_some() {
+            return Response::failure(ipc::INVALID, format!("Disconnect {} before renaming it.", entry.name));
+        }
+        if let Err(error) = store::rename(&entry.name, new_name) {
+            log!("{}: can't rename: {}", entry.name, error);
+            return Response::failure(ipc::FAILED, format!("Can't rename the configuration: {}.", error));
+        }
+        devkey::rename(&entry.name, new_name, &entry.id);
+        log!("{}: renamed {}", entry.name, new_name);
+        entry.name = new_name.to_string();
+        self.entries.sort_by_key(|entry| entry.name.to_lowercase());
+        Response::success()
+    }
+
+    // The app logged in to the login page of the tunnel, or saw the session end: the routes and the DNS servers that
+    // wait for the login go on, or off again. Nothing waits in a tunnel without a login.
+    fn logged_in(&mut self, name: &str, logged_in: bool) -> Response {
+        let Some(entry) = self.find(name) else {
+            return Response::failure(ipc::NOT_FOUND, format!("There's no VPN named {}.", name));
+        };
+        let Some(active) = entry.active.as_mut() else {
+            return Response::failure(ipc::INVALID, format!("{} isn't connected.", entry.name));
+        };
+        if active.logged_in == logged_in || !steps(&entry.config).dns_after {
+            return Response::success();
+        }
+        match active.tunnel.after_login(logged_in) {
+            Ok(()) => {
+                active.logged_in = logged_in;
+                if logged_in {
+                    log!("{}: logged in, the routes to the internet and the DNS servers are on", entry.name);
+                } else {
+                    log!("{}: not logged in, the routes to the internet and the DNS servers are off", entry.name);
+                }
+                Response::success()
+            }
+            Err(error) => {
+                log!("{}: {}", entry.name, error);
+                Response::failure(ipc::FAILED, error)
+            }
         }
     }
 
@@ -323,7 +419,7 @@ impl Manager {
 
     pub fn handle(&mut self, request: Request, client: &Client) -> Response {
         let denied = || {
-            Response::failure(ipc::ACCESS_DENIED, "Only an administrator can add or remove a VPN on this computer.")
+            Response::failure(ipc::ACCESS_DENIED, "Only an administrator can add, rename or remove a VPN on this computer.")
         };
         match request {
             Request::List => {
@@ -343,6 +439,13 @@ impl Manager {
                 }
                 self.remove(&name)
             }
+            Request::Rename { name, new_name } => {
+                if !client.can_manage {
+                    return denied();
+                }
+                self.rename(&name, &new_name)
+            }
+            Request::LoggedIn { name, logged_in } => self.logged_in(&name, logged_in),
             Request::Sign { name, host, challenge, username, machine_id } => {
                 self.sign(&name, host, &challenge, &username, machine_id)
             }
@@ -407,6 +510,8 @@ fn info(entry: &Entry) -> TunnelInfo {
             .unwrap_or_default(),
         addresses: config.addresses.iter().map(ToString::to_string).collect(),
         routes: config.routes().iter().map(ToString::to_string).collect(),
+        after_login: steps(config).after.iter().map(ToString::to_string).collect(),
+        logged_in: active.is_some_and(|active| active.logged_in),
         interface: active.map_or(0, |active| active.tunnel.interface()),
         since: active.map_or(0, |active| active.since),
         handshake: peers.iter().map(|peer| peer.handshake).max().unwrap_or(0),
@@ -528,6 +633,7 @@ pub mod fake {
             _id: &store::Id,
             config: &Config,
             endpoints: &[Option<SocketAddr>],
+            _steps: &Steps,
         ) -> Result<Box<dyn Tunnel>, String> {
             let now = unix_now();
             let peers = config
@@ -558,6 +664,8 @@ mod tests {
         tx: u64,
         endpoint: Option<SocketAddr>,
         refuse: bool,
+        // the routes of after the login, as the manager asked
+        after_login: bool,
     }
 
     struct ScriptedTunnel(Arc<Mutex<Script>>, conf::Key);
@@ -591,13 +699,29 @@ mod tests {
             script.endpoint = Some(address);
             Ok(())
         }
+
+        fn after_login(&mut self, on: bool) -> Result<(), String> {
+            let mut script = self.0.lock().unwrap();
+            if script.refuse {
+                return Err("can't add the route to 0.0.0.0/0: refused".into());
+            }
+            script.after_login = on;
+            Ok(())
+        }
     }
 
     // turns nothing on: the tests make the tunnels themselves
     struct NoEngine;
 
     impl Engine for NoEngine {
-        fn start(&mut self, _: &str, _: &store::Id, _: &Config, _: &[Option<SocketAddr>]) -> Result<Box<dyn Tunnel>, String> {
+        fn start(
+            &mut self,
+            _: &str,
+            _: &store::Id,
+            _: &Config,
+            _: &[Option<SocketAddr>],
+            _: &Steps,
+        ) -> Result<Box<dyn Tunnel>, String> {
             Err("no engine in the tests".into())
         }
     }
@@ -616,7 +740,8 @@ mod tests {
         // a GUID on Windows, nothing on macOS
         #[allow(clippy::default_constructed_unit_structs)]
         let mut entry = Entry::new("Office".into(), store::Id::default(), config);
-        entry.active = Some(Active { tunnel: Box::new(tunnel), since: unix_now(), session: 1, id: next_id(), failovers });
+        let tunnel: Box<dyn Tunnel> = Box::new(tunnel);
+        entry.active = Some(Active { tunnel, since: unix_now(), session: 1, id: next_id(), failovers, logged_in: false });
         let manager = Manager { entries: vec![entry], engine: Box::new(NoEngine) };
         (manager, script)
     }
@@ -700,6 +825,86 @@ mod tests {
         // off: nothing to watch
         manager.down("Office");
         assert!(poll(&mut manager, &script, start, 300, 0, 0).is_empty());
+    }
+
+    #[test]
+    fn renames_refused() {
+        let (mut manager, _) = office();
+        let config = conf::parse(CONFIG).unwrap();
+        #[allow(clippy::default_constructed_unit_structs)]
+        manager.entries.push(Entry::new("Home".into(), store::Id::default(), config));
+        let admin = Client { session: 1, can_manage: true };
+        let rename = |manager: &mut Manager, name: &str, new_name: &str, client: &Client| {
+            manager.handle(Request::Rename { name: name.into(), new_name: new_name.into() }, client)
+        };
+        let user = Client { session: 1, can_manage: false };
+        assert_eq!(rename(&mut manager, "Home", "Lab", &user).error_code(), ipc::ACCESS_DENIED);
+        assert_eq!(rename(&mut manager, "Home", "../Lab", &admin).error_code(), ipc::INVALID);
+        assert_eq!(rename(&mut manager, "Nowhere", "Lab", &admin).error_code(), ipc::NOT_FOUND);
+        // another one has the name, whatever the case
+        assert_eq!(rename(&mut manager, "Home", "office", &admin).error_code(), ipc::EXISTS);
+        // on: the app knows it by its name
+        assert_eq!(rename(&mut manager, "Office", "Work", &admin).error_code(), ipc::INVALID);
+        // the same name: nothing to do
+        assert!(rename(&mut manager, "home", "Home", &admin).ok);
+        assert_eq!(manager.list().iter().map(|info| info.name.as_str()).collect::<Vec<_>>(), ["Office", "Home"]);
+    }
+
+    // CONFIG with a login page and other routes
+    fn with_login(allowed_ips: &str) -> Config {
+        let text = CONFIG
+            .replace("[Interface]\n", "[Interface]\n# Login = http://10.103.1.1:8181/\n")
+            .replace("AllowedIPs = 10.103.1.0/24", &format!("AllowedIPs = {}", allowed_ips));
+        conf::parse(&text).unwrap()
+    }
+
+    #[test]
+    fn two_steps_with_a_login() {
+        let texts = |nets: &[IpNet]| nets.iter().map(ToString::to_string).collect::<Vec<_>>();
+        // the full tunnel of the firewall: only the login page before the login
+        let full = steps(&with_login("0.0.0.0/0, ::/0"));
+        assert_eq!(texts(&full.before), ["10.103.1.1/32"]);
+        assert_eq!(texts(&full.after), ["0.0.0.0/0", "::/0"]);
+        assert!(full.dns_after);
+        // a split tunnel: its routes as they are, only the DNS servers wait
+        let split = steps(&with_login("192.168.1.0/24, 10.103.1.0/24"));
+        assert_eq!(texts(&split.before), ["192.168.1.0/24", "10.103.1.0/24"]);
+        assert!(split.after.is_empty() && split.dns_after);
+        // a public network of the office waits with the internet
+        let public = steps(&with_login("203.0.113.0/24, 10.103.1.0/24"));
+        assert_eq!(texts(&public.before), ["10.103.1.0/24"]);
+        assert_eq!(texts(&public.after), ["203.0.113.0/24"]);
+        // no login, or a login page out of the tunnel: all at once
+        let plain = steps(&conf::parse(&CONFIG.replace("10.103.1.0/24", "0.0.0.0/0")).unwrap());
+        assert_eq!(texts(&plain.before), ["0.0.0.0/0"]);
+        assert!(plain.after.is_empty() && !plain.dns_after);
+        assert!(!steps(&with_login("192.168.1.0/24")).dns_after);
+    }
+
+    #[test]
+    fn the_routes_of_after_the_login() {
+        let (mut manager, script) = office();
+        let user = Client { session: 1, can_manage: false };
+        let logged_in = |manager: &mut Manager, on: bool| {
+            manager.handle(Request::LoggedIn { name: "Office".into(), logged_in: on }, &user)
+        };
+        // no login page: nothing waits
+        assert!(logged_in(&mut manager, true).ok);
+        assert!(!script.lock().unwrap().after_login && !manager.list()[0].logged_in);
+        assert!(manager.list()[0].after_login.is_empty());
+        manager.entries[0].config = with_login("0.0.0.0/0");
+        assert_eq!(manager.list()[0].after_login, ["0.0.0.0/0"]);
+        assert!(logged_in(&mut manager, true).ok);
+        assert!(script.lock().unwrap().after_login && manager.list()[0].logged_in);
+        // the session ended
+        assert!(logged_in(&mut manager, false).ok);
+        assert!(!script.lock().unwrap().after_login && !manager.list()[0].logged_in);
+        // refused by the system: still off, and said
+        script.lock().unwrap().refuse = true;
+        assert_eq!(logged_in(&mut manager, true).error_code(), ipc::FAILED);
+        assert!(!manager.list()[0].logged_in);
+        manager.down("Office");
+        assert_eq!(logged_in(&mut manager, true).error_code(), ipc::INVALID);
     }
 
     #[test]

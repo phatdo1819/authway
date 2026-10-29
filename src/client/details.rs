@@ -134,7 +134,7 @@ fn route_text(net: &IpNet) -> String {
 }
 
 // "vpn.example.com:51820" or "[2001:db8::1]:51820": the host and the port
-fn split_endpoint(endpoint: &str) -> (String, String) {
+pub(crate) fn split_endpoint(endpoint: &str) -> (String, String) {
     match endpoint.rsplit_once(':') {
         Some((host, port)) if !host.is_empty() && port.parse::<u16>().is_ok() => {
             (host.trim_start_matches('[').trim_end_matches(']').to_string(), port.to_string())
@@ -143,7 +143,7 @@ fn split_endpoint(endpoint: &str) -> (String, String) {
     }
 }
 
-fn sentence(text: &str) -> String {
+pub(crate) fn sentence(text: &str) -> String {
     let mut chars = text.chars();
     match chars.next() {
         Some(first) => first.to_uppercase().chain(chars).collect(),
@@ -159,7 +159,7 @@ fn list_or(items: &[String], empty: &str) -> String {
     }
 }
 
-fn handshake_text(handshake: u64) -> String {
+pub(crate) fn handshake_text(handshake: u64) -> String {
     if handshake == 0 {
         strings::VALUE_NOT_YET.to_string()
     } else {
@@ -184,13 +184,21 @@ pub fn details(tunnel: &Tunnel) -> Details {
     let routes: Vec<IpNet> = info.routes.iter().filter_map(|route| IpNet::parse(route)).collect();
     details.group(GROUP_ROUTING, strings::GROUP_ROUTING);
     details.row(strings::DETAIL_MODE, routing_text(routing(&routes)));
+    if !info.after_login.is_empty() {
+        details.row(strings::DETAIL_BEFORE_LOGIN, strings::VALUE_BEFORE_LOGIN);
+    }
     for route in &routes {
         details.row(route.to_string(), route_text(route));
     }
 
     details.group(GROUP_COMPUTER, strings::GROUP_COMPUTER);
     details.row(strings::DETAIL_ADDRESS, list_or(&info.addresses, strings::VALUE_NONE));
-    details.row(strings::DETAIL_DNS, list_or(&info.dns, strings::VALUE_DNS_NONE));
+    // the service sets the ones of a tunnel with a login page only with the login
+    let dns = match (&info.login, info.dns.is_empty()) {
+        (Some(_), false) => strings::value_dns_after_login(&info.dns.join(", ")),
+        _ => list_or(&info.dns, strings::VALUE_DNS_NONE),
+    };
+    details.row(strings::DETAIL_DNS, dns);
     if !info.dns_search.is_empty() {
         details.row(strings::DETAIL_DNS_SEARCH, info.dns_search.join(", "));
     }

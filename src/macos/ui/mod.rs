@@ -17,7 +17,8 @@ use objc2::runtime::{AnyObject, ProtocolObject, Sel};
 use objc2::{define_class, msg_send, sel, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSAlert, NSAlertStyle, NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
-    NSApplicationTerminateReply, NSControlTextEditingDelegate, NSImage, NSMenu, NSMenuDelegate, NSMenuItem,
+    NSApplicationTerminateReply, NSControlStateValueOn, NSControlTextEditingDelegate, NSImage, NSMenu, NSMenuDelegate,
+    NSMenuItem,
     NSStatusBar, NSStatusItem, NSTextFieldDelegate, NSVariableStatusItemLength, NSView, NSWindow, NSWindowDelegate,
 };
 use objc2_foundation::{
@@ -266,6 +267,22 @@ fn add_items(target: &Target, menu: &NSMenu, items: &[MenuItem], commands: &mut 
                 commands.push(command.clone());
                 menu.addItem(&entry);
             }
+            MenuItem::Switch { name, state, on, command } => {
+                let title = if state.is_empty() { name.clone() } else { format!("{} ({})", name, state) };
+                let entry = menu_item(mtm, &title, command.as_ref().map(|_| sel!(menuChosen:)));
+                if *on {
+                    entry.setState(NSControlStateValueOn);
+                }
+                match command {
+                    Some(command) => {
+                        unsafe { entry.setTarget(Some(target.object())) };
+                        entry.setTag(commands.len() as isize);
+                        commands.push(command.clone());
+                    }
+                    None => entry.setEnabled(false),
+                }
+                menu.addItem(&entry);
+            }
             MenuItem::Submenu { text, items } => {
                 let submenu = NSMenu::initWithTitle(NSMenu::alloc(mtm), &ns(text));
                 submenu.setAutoenablesItems(false);
@@ -286,6 +303,8 @@ pub fn menu_item(mtm: MainThreadMarker, title: &str, action: Option<Sel>) -> Ret
 fn run_command(command: Command) {
     let Some(mtm) = MainThreadMarker::new() else { return };
     match command {
+        // the menu bar is all there is on macOS
+        Command::Open => {}
         Command::Connect(name) => {
             with_app(|app| app.connect(&name));
         }

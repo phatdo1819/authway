@@ -24,10 +24,29 @@ All the names of the app are in [src/product.rs](src/product.rs), and the name o
 
 1. Open `authway-<version>-x64.msi`, or `-arm64.msi` on a Windows on ARM computer, and click **Next**,
    **Install**. Windows asks for the permission of an administrator, once.
-2. The app is next to the clock, and starts at every sign-in. Right-click its icon, **Add a VPN from its file...**,
-   and choose the `.conf` file of the administrator. The app saves it protected and offers to delete the file.
-3. **Connect**: the window asks for username, password and code while the tunnel comes up. The sixth digit of the
-   code connects.
+2. The window of the app opens, and at every sign-in. Click **Add VPN** and choose the `.conf` file of the
+   administrator, or drop the file on the window. The app saves it protected and offers to delete the file.
+3. Turn on the switch of the VPN: the login window asks for username, password and code while the tunnel comes up.
+   The sixth digit of the code connects.
+
+**The window** shows a card for each VPN: its switch, the server, its state in words and in color (green connected,
+amber waiting for the login or the server, red refused, with what to do), and, while it's on, its speed and for how
+long. **Log in** on the card opens the login when the VPN waits for it. A click on the card opens the page of the VPN:
+- its state and switch;
+- the traffic of the last minutes, as a graph, with the speeds, the bytes, the address of the computer in the VPN,
+  the server and the routing: all the traffic, or which networks;
+- its name, to rename it while it's off;
+- the username of the login, and whether the password is saved, with **Forget it**;
+- **All details** (below) and **Remove this VPN**.
+
+Closing the window leaves the app running next to the clock, where its icon opens the window again (a click) or
+its menu (a right-click), as starting the app from the Start menu does. The menu is short: **Open Authway**, a line
+for each VPN, ticked while it's on, with its state (a click turns it on or off, or opens the login it waits for),
+**Add a VPN from its file...** and **Quit**; with more than eight VPNs, the ones that are on stay there and all of them
+are under **All the VPNs**. **⋯** in the window has **Add a VPN from its file...**, the logs, **Open the window at
+sign-in** (on by default) and **Quit**. The window follows the size of
+the texts and the scale of each display, Tab, Space and Enter work in it, and high contrast gives it the colors of
+the system.
 
 When the server requires device binding, the first login enrolls this computer: the window says so. The VPN then
 works only on this computer, even for someone who has the file and the password. On a new computer, or after
@@ -37,7 +56,13 @@ When the session ends on the firewall (it expired, or the computer changed netwo
 username and the saved password: only the code is needed. **Cancel** or **Disconnect** turns the tunnel off; the
 app logs out first. Quitting the app turns the tunnels off.
 
-**Details...**, under each VPN in the menu, shows all of it, live: the state, the last handshake and the bytes; the
+**Before the login**, a VPN with a login carries only the login page and the private networks of the office, without
+its DNS servers: the internet goes through the computer's own connection, as without the VPN. A VPN that waits for
+the login, or whose server doesn't answer, never cuts the internet. With the login, a full tunnel takes all the
+traffic and the DNS servers of the VPN come on. When the session ends, or the login page doesn't answer for 30
+seconds, they go off again until the next login.
+
+**All details**, on the page of a VPN (**Details...** in the menu on macOS), shows all of it, live: the state, the last handshake and the bytes; the
 routing, a full tunnel (all the traffic) or a split tunnel with its networks; the addresses, DNS servers, MTU, listen
 port and public key of the computer; the address, port and public key of the server, its fallback addresses and the
 one in use, its keepalive, whether it has a preshared key; the login page and the session. Never a private or
@@ -52,11 +77,15 @@ can install it. As administrator, without windows:
 ```
 msiexec /i authway-0.1.0-x64.msi /qn
 "C:\Program Files\Authway\authway.exe" --import "C:\path\office.conf" --name "Office"
+"C:\Program Files\Authway\authway.exe" --rename "Office" --to "Head office"
 "C:\Program Files\Authway\authway.exe" --remove "Office"
 msiexec /x authway-0.1.0-x64.msi /qn
 ```
 
-- **Install**: the app starts at once for every user signed in, and at every sign-in after.
+- **Install**: the app starts at once for every user signed in, and at every sign-in after, with its window unless
+  the user turned that off.
+- **Rename**: only while the VPN is off. Its device key and the saved logins stay (they belong to the VPN and to
+  its login page, not to its name).
 - **Update**: install the new package over the old one: it replaces it, even at the same version. The VPNs are kept;
   the app of each user logs out, turns its tunnels off and quits, then starts again.
 - **Remove**: from **Settings > Apps**, or `msiexec /x`. It takes away the service, the VPNs with their device keys,
@@ -88,7 +117,7 @@ the code when the server asks for one):
   the process auditing of Windows when it's on: prefer having users type it once and check **Remember my
   password**, and change the password after a deployment that might have logged it.
 
-**Who can add and remove VPNs.** By default only an administrator: a VPN can route all the traffic of the computer
+**Who can add, rename and remove VPNs.** By default only an administrator: a VPN can route all the traffic of the computer
 and change its DNS, so a user who isn't one sees the permission of Windows when adding or removing a VPN. Any user
 can connect and disconnect the VPNs that are there; no group membership is needed. To let every user add and remove
 them without that permission:
@@ -116,7 +145,7 @@ reg add "HKLM\SOFTWARE\Policies\Authway" /v AllowUserImport /t REG_DWORD /d 1 /f
  the user                                   SYSTEM
 ┌──────────────────────┐   named pipe   ┌────────────────────────┐  wireguard.dll   ┌─────────────┐
 │ authway.exe          │◄──────────────►│ authway.exe            │◄────────────────►│ WireGuardNT │
-│ icon, login, details │  JSON, a line  │ --service              │  adapters, keys  │ (driver)    │
+│ window, icon, login  │  JSON, a line  │ --service              │  adapters, keys  │ (driver)    │
 └──────────┬───────────┘                └────────────────────────┘                  └─────────────┘
            │ HTTP through the tunnel: /api/status, /api/login, /api/logout of ns-wgauth
            ▼
@@ -132,8 +161,18 @@ reg add "HKLM\SOFTWARE\Policies\Authway" /v AllowUserImport /t REG_DWORD /d 1 /f
 - **The tunnels** are WireGuardNT adapters, made by the official `wireguard.dll` of WireGuard LLC, shipped next to
   the exe as it is downloaded ([tools/fetch-wireguard.ps1](tools/fetch-wireguard.ps1) checks its hash and its
   signature). The service sets the addresses, the routes of `AllowedIPs` (metric 0), the MTU (the one of the
-  configuration, or of the network to the server less 80) and the DNS servers. A tunnel goes off when the user who
-  turned it on signs out, and when the service stops.
+  configuration, or of the network to the server less 80) and the DNS servers, in two steps when there's a login
+  (below). A tunnel goes off when the user who turned it on signs out, and when the service stops.
+- **Two steps with a login** (`Steps` in [src/manager.rs](src/manager.rs)): when the configuration has a `# Login =`
+  line, the service turns the tunnel on with the routes of its private networks (10.0.0.0/8, 172.16.0.0/12,
+  192.168.0.0/16, 100.64.0.0/10, the link-local ones, fc00::/7) and a route to the login page alone, without the DNS
+  servers. The other routes wait: `0.0.0.0/0` and `::/0` of a full tunnel, or a public network. Once logged in, the
+  app tells the service (`logged_in` on the pipe), which adds them with the DNS servers. When the status says the
+  session ended, or the login page didn't answer for 30 seconds, the app tells it again and the service takes them
+  back. Only the routes and the DNS of the computer change, never the configuration of WireGuard: the firewall still
+  lets only the login page through before the login. A split tunnel keeps all its routes; only its DNS servers wait,
+  which the firewall would answer with the address of the login page before the login. A tunnel without the line,
+  a page found by the app included, gets everything at once.
 - **Fallback addresses**: the firewall writes the other addresses of a server, a second internet line for example,
   in a `# Fallback = host:port, ...` line after `Endpoint` (on NethSecurity, the *Fallback endpoints* of the server;
   by hand, a fallback without a port takes the one of `Endpoint`). The service reads the counters of the driver every
@@ -178,7 +217,8 @@ reg add "HKLM\SOFTWARE\Policies\Authway" /v AllowUserImport /t REG_DWORD /d 1 /f
   administrator rights.
 
 The logs, without passwords, codes or keys: `%LOCALAPPDATA%\Authway\client.log` for the app,
-`C:\Program Files\Authway\log\service.log` for the service and the driver. Both are in the menu, under **Logs**.
+`C:\Program Files\Authway\log\service.log` for the service and the driver. Both are under **⋯ > Logs** in the
+window.
 
 ## Build
 
@@ -210,6 +250,19 @@ touches an installed app. The end-to-end test drove that build against the real 
 login with a wrong password then the right one, the session ended by the server, the saved password, cancel, quit
 with logout, removal, and a saved login page out of the routes, dropped.
 
+The window was driven the same way, through its buttons, against that build and the same daemon code: the empty
+list, two VPNs added from the command line, the page of one, its switch, the card of the other switched on, the
+speeds, a rename once off (the registry key follows, the page and the card too), a VPN with a login (the saved
+username and password on its page, **Log in** on the card and the page while the login waits, a new username, the
+password forgotten), the banner when the service stops, closing it (the app stays) and a second start that shows it
+again. The unit tests check the cards (state, tone, what to do, routing), the speeds made from the counters and the
+renames the service refuses.
+
+The two steps of a VPN with a login were driven the same way, with a full tunnel: its routes to the internet wait
+for the login, come on with it, go when the server ends the session, come back with the next login and go when the
+server stops answering, after 30 seconds without an answer (in the log of the service: the fake tunnels change no
+route). The unit tests check which routes wait, for full and split tunnels, and when the app asks for them.
+
 The way out of the login: the unit tests check that discovery never goes out of the routes, the redirect included,
 and that nothing is sent through another network adapter. On the real driver, two WireGuardNT adapters on 127.0.0.1
 played the tunnel and a local network that pushes a more specific route to the login page: a plain connection went
@@ -235,7 +288,8 @@ update that keeps the VPNs and restarts the app, and a removal that leaves nothi
 
 ## macOS
 
-The same app for macOS 11 or later, Apple silicon and Intel in one package: the same menu, login window, details,
+The same app for macOS 11 or later, Apple silicon and Intel in one package: the menu of Windows before its window
+(each VPN with its actions, the removal, the logs), the same login window, details,
 fallback addresses and rules for the password, from the same code ([src/client](src/client),
 [src/manager.rs](src/manager.rs)); what differs is in [src/macos](src/macos).
 
@@ -300,7 +354,7 @@ sudo "/Library/Application Support/Authway/uninstall.sh"
   keys on its command line. The service sets the addresses and the routes as `wg-quick` does (a default route as two
   halves, the server kept out of the tunnel through the gateway of the network), and the DNS servers on every
   network service, put back when the tunnel goes off, and at the start of the service after a crash. It looks at
-  them again when the network changes.
+  them again when the network changes. A tunnel with a login gets them in the same two steps as on Windows.
 - **The session of a tunnel** is the user who turned it on. macOS doesn't tell a service when a user logs out: the
   app lists the tunnels at least every 10 seconds, and the service turns off the tunnels of a user whose app stopped
   asking for 2 minutes.
@@ -332,8 +386,9 @@ tunnels; the test of the login on `127.0.0.2` needs `sudo ifconfig lo0 alias 127
 
 ## Not done yet
 
-- Tested with a real NethSecurity server: not yet (the real driver only on 127.0.0.1).
-- macOS: never run on a Mac yet, see above.
+- Tested with a real NethSecurity server: not yet (the real driver only on 127.0.0.1). The two steps of a VPN with
+  a login: not on the real driver nor on a Mac yet.
+- macOS: never run on a Mac yet, see above. The window is Windows only: on macOS the app is in the menu bar.
 - No kill switch: when the tunnel is down, the traffic goes out of it; no block of the DNS outside of the tunnel.
 - The packages and the programs aren't signed by a known publisher: SmartScreen and Gatekeeper warn when they're
   downloaded.

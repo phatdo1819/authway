@@ -167,6 +167,9 @@ pub fn sign(tunnel: &str, id: &store::Id, data: &[u8]) -> Result<Vec<u8>, String
     Ok(der_signature(&raw))
 }
 
+// with its tunnel, which stays enrolled: the key has the name of the GUID, which a renamed tunnel keeps
+pub fn rename(_tunnel: &str, _new_name: &str, _id: &store::Id) {}
+
 // with its tunnel: a new tunnel of the same name gets a new key, enrolled again
 pub fn delete(tunnel: &str, id: &store::Id) {
     let result = Provider::open().and_then(|provider| open(&provider, id));

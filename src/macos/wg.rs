@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use crate::conf::{self, Config};
 use crate::log;
-use crate::manager::{Engine, PeerStats, Tunnel};
+use crate::manager::{Engine, PeerStats, Steps, Tunnel};
 use crate::net::{self, Network};
 use crate::store;
 use crate::{setup, uapi};
@@ -199,6 +199,11 @@ impl Tunnel for GoTunnel {
             .map_err(|error| format!("can't change the address of the server: {}", error))
     }
 
+    fn after_login(&mut self, on: bool) -> Result<(), String> {
+        self.network.after_login(on);
+        Ok(())
+    }
+
     fn upkeep(&mut self) {
         self.network.upkeep();
     }
@@ -213,6 +218,7 @@ impl Engine for GoEngine {
         _id: &store::Id,
         config: &Config,
         endpoints: &[Option<SocketAddr>],
+        steps: &Steps,
     ) -> Result<Box<dyn Tunnel>, String> {
         let device = Device::start(name)?;
         let mtu = match config.mtu {
@@ -223,7 +229,7 @@ impl Engine for GoEngine {
         let result = device.set(&request);
         wipe(request);
         result.map_err(|error| format!("can't configure the tunnel: {}", error))?;
-        let network = Network::configure(&device.name, config, mtu, endpoints)?;
+        let network = Network::configure(&device.name, config, mtu, endpoints, steps)?;
         let servers: Vec<String> = endpoints.iter().flatten().map(ToString::to_string).collect();
         log!("{}: {} to {}, MTU {}", name, device.name, servers.join(", "), mtu);
         Ok(Box::new(GoTunnel { network, device, mtu }))

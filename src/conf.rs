@@ -75,7 +75,24 @@ impl IpNet {
             _ => None,
         }
     }
+
+    // all of it in a network that the internet doesn't route
+    pub fn is_private(&self) -> bool {
+        PRIVATE_NETWORKS.iter().any(|range| self.prefix >= range.prefix && range.contains(self.addr))
+    }
 }
+
+// the private networks of IPv4, the shared one of the providers (RFC 6598), the link-local ones and the unique
+// local addresses of IPv6
+const PRIVATE_NETWORKS: [IpNet; 7] = [
+    IpNet { addr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), prefix: 8 },
+    IpNet { addr: IpAddr::V4(Ipv4Addr::new(172, 16, 0, 0)), prefix: 12 },
+    IpNet { addr: IpAddr::V4(Ipv4Addr::new(192, 168, 0, 0)), prefix: 16 },
+    IpNet { addr: IpAddr::V4(Ipv4Addr::new(100, 64, 0, 0)), prefix: 10 },
+    IpNet { addr: IpAddr::V4(Ipv4Addr::new(169, 254, 0, 0)), prefix: 16 },
+    IpNet { addr: IpAddr::V6(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0)), prefix: 7 },
+    IpNet { addr: IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0)), prefix: 10 },
+];
 
 impl fmt::Display for IpNet {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -730,6 +747,14 @@ mod tests {
         assert!(IpNet::parse("::/0").unwrap().contains("2001:db8::1".parse().unwrap()));
         assert!(!IpNet::parse("::/0").unwrap().contains("10.0.0.1".parse().unwrap()));
         assert_eq!(IpNet::parse("fd00::5/64").unwrap().network().to_string(), "fd00::/64");
+        let private = |text: &str| IpNet::parse(text).unwrap().is_private();
+        for text in ["10.103.1.0/24", "172.31.0.0/16", "192.168.1.5", "100.64.0.0/10", "fd00::/64", "fe80::/64"] {
+            assert!(private(text), "{}", text);
+        }
+        // the internet, or more than a private network
+        for text in ["0.0.0.0/0", "::/0", "0.0.0.0/1", "8.8.8.8", "172.32.0.0/16", "10.0.0.0/7", "2001:db8::/32"] {
+            assert!(!private(text), "{}", text);
+        }
         for bad in ["10.0.0.1/33", "10.0.0.1/", "10.0.0.1/-1", "10.0.0/24", "::1/129", "name/24"] {
             assert!(IpNet::parse(bad).is_none(), "{}", bad);
         }

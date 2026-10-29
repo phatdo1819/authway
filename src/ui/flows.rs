@@ -248,6 +248,51 @@ pub fn remove(owner: HWND, name: &str) {
     with_app(|app| app.removed(name));
 }
 
+// while it's off: true when it's renamed
+pub fn rename(owner: HWND, name: &str, new_name: &str) -> bool {
+    let request = Request::Rename { name: name.to_string(), new_name: new_name.to_string() };
+    match ipc::call(&request) {
+        Ok(response) if response.ok => {}
+        Ok(response) if response.error_code() == ipc::ACCESS_DENIED => {
+            match setup::elevate(&format!("--rename {} --to {}", quote(name), quote(new_name)), owner) {
+                Ok(0) => {}
+                Ok(_) => return false,
+                Err(error) if error == CANCELLED => return false,
+                Err(error) => {
+                    error_box(owner, &error);
+                    return false;
+                }
+            }
+        }
+        Ok(response) => {
+            error_box(owner, &strings::rename_failed(response.message()));
+            return false;
+        }
+        Err(error) => {
+            error_box(owner, &call_text(&error));
+            return false;
+        }
+    }
+    log!("{}: renamed {}", name, new_name);
+    with_app(|app| app.renamed(name, new_name));
+    true
+}
+
+// --rename <name> --to <new name>, as administrator
+pub fn rename_command(name: &str, new_name: &str) -> i32 {
+    match ipc::call(&Request::Rename { name: name.to_string(), new_name: new_name.to_string() }) {
+        Ok(response) if response.ok => 0,
+        Ok(response) => {
+            error_box(ptr::null_mut(), &strings::rename_failed(response.message()));
+            1
+        }
+        Err(error) => {
+            error_box(ptr::null_mut(), &call_text(&error));
+            1
+        }
+    }
+}
+
 // --remove <name>, as administrator
 pub fn remove_command(name: &str) -> i32 {
     match ipc::call(&Request::Remove { name: name.to_string() }) {

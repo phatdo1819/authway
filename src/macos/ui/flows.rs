@@ -232,6 +232,21 @@ pub fn remove_command(name: &str) -> i32 {
     }
 }
 
+// --rename <name> --to <new name>, as root
+pub fn rename_command(name: &str, new_name: &str) -> i32 {
+    match ipc::call(&Request::Rename { name: name.to_string(), new_name: new_name.to_string() }) {
+        Ok(response) if response.ok => 0,
+        Ok(response) => {
+            eprintln!("{}", response.message());
+            1
+        }
+        Err(error) => {
+            eprintln!("{}", call_text(&error));
+            1
+        }
+    }
+}
+
 // The tunnels go off with the app: nobody would watch their session anymore
 pub fn stop_tunnels() {
     let active = with_app(|app| app.active_tunnels()).unwrap_or_default();

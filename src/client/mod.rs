@@ -5,6 +5,7 @@
 
 pub mod details;
 pub mod import;
+pub mod overview;
 
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
@@ -32,6 +33,8 @@ const RETRY_CONNECTING: Duration = Duration::from_secs(1);
 const CONNECTING_TIME: Duration = Duration::from_secs(30);
 const LIST_ACTIVE: Duration = Duration::from_secs(2);
 const LIST_IDLE: Duration = Duration::from_secs(10);
+// a login page that doesn't answer for so long: the routes to the internet go off until it answers again
+const UNREACHABLE_ROUTES: Duration = Duration::from_secs(30);
 // seconds without a handshake for "the server doesn't answer"
 const NO_HANDSHAKE: u64 = 15;
 const OLD_HANDSHAKE: u64 = 300;
@@ -92,6 +95,10 @@ pub struct Tunnel {
     pub changed_at: Instant,
     pub up_at: Option<Instant>,
     pub error: Option<String>,
+    // since when the login page doesn't answer
+    pub unreachable_since: Option<Instant>,
+    // the routes of after the login asked on or off to the service, not answered yet
+    pub routes_asked: Option<bool>,
 }
 
 impl Tunnel {
@@ -120,6 +127,8 @@ impl Tunnel {
             changed_at: now.checked_sub(Duration::from_secs(3600)).unwrap_or(now),
             up_at: None,
             error: None,
+            unreachable_since: None,
+            routes_asked: None,
         }
     }
 
@@ -175,6 +184,7 @@ impl Tunnel {
         self.connecting_since = None;
         self.error = None;
         self.up_at = Some(now);
+        self.unreachable_since = None;
     }
 
     fn set_off(&mut self) {
@@ -187,10 +197,27 @@ impl Tunnel {
         self.searched = false;
         self.announced = false;
         self.up_at = None;
+        self.unreachable_since = None;
     }
 
     pub fn needs_login(&self) -> bool {
         self.info.up && self.session == Session::NeedLogin
+    }
+
+    // Whether the routes to the internet and the DNS servers that wait for the login should be on, from what the
+    // login page says: None while it's not known. Off when the session ends, and while the server doesn't answer:
+    // the internet goes on through the network of the computer.
+    fn wants_after_login(&self, now: Instant) -> Option<bool> {
+        match self.session {
+            Session::LoggedIn | Session::NotRequired => Some(true),
+            Session::NeedLogin => Some(false),
+            Session::Blocked | Session::NoUser | Session::NoOtp | Session::NotEnrolled => Some(false),
+            Session::Unreachable => {
+                let long = self.unreachable_since.is_some_and(|since| now.duration_since(since) >= UNREACHABLE_ROUTES);
+                long.then_some(false)
+            }
+            Session::Off | Session::Checking => None,
+        }
     }
 
     pub fn connecting(&self) -> bool {
@@ -335,10 +362,13 @@ pub enum Event {
     Status { name: String, generation: u32, result: ApiResult },
     Login { name: String, generation: u32, result: ApiResult, username: String, password: String, remember: bool },
     Found { name: String, generation: u32, page: Option<Page> },
+    LoggedIn { name: String, logged_in: bool, result: Result<Response, CallError> },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
+    // the main window, where the system has one
+    Open,
     Connect(String),
     Disconnect(String),
     LogIn(String),
@@ -358,8 +388,31 @@ pub enum MenuItem {
     Label(String),
     // the default one is the first that turns on or logs in
     Action { text: String, command: Command, default: bool },
+    // a VPN: ticked while it's on, with its state after it; greyed without a command, while it turns off
+    Switch { name: String, state: String, on: bool, command: Option<Command> },
     Submenu { text: String, items: Vec<MenuItem> },
     Separator,
+}
+
+// with a main window, more VPNs than this go into a submenu: the menu keeps the ones that are on
+const MENU_SWITCHES: usize = 8;
+
+// A VPN in the short menu: choosing it turns it on or off, or opens the login it waits for
+fn switch_item(tunnel: &Tunnel) -> MenuItem {
+    let name = tunnel.info.name.clone();
+    let on = (tunnel.info.up || tunnel.connecting()) && !tunnel.stopping;
+    let (state, command) = if tunnel.stopping {
+        (strings::STATE_DISCONNECTING.to_string(), None)
+    } else if tunnel.needs_login() {
+        (strings::MENU_LOG_IN.to_string(), Some(Command::LogIn(name.clone())))
+    } else if on {
+        let state = if tunnel.session == Session::LoggedIn { strings::STATE_CONNECTED.to_string() } else { tunnel.describe() };
+        (state, Some(Command::Disconnect(name.clone())))
+    } else {
+        let state = if tunnel.error.is_some() { strings::STATE_FAILED } else { "" };
+        (state.to_string(), Some(Command::Connect(name.clone())))
+    };
+    MenuItem::Switch { name, state, on, command }
 }
 
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
@@ -427,6 +480,15 @@ pub trait Shell {
     fn open_details(&mut self, tunnel: &str, details: Details) -> Option<Self::Details>;
     // the user wants to add a VPN: the file dialog, out of the App
     fn import_later(&mut self);
+    // whether the system has a main window, with the VPNs
+    fn has_main(&self) -> bool {
+        false
+    }
+    // Opens the main window, at the start of the app or when the user asks for it: false when the system has none,
+    // or doesn't want it at this start; the App then says what it would have said in it
+    fn show_main(&mut self, _startup: Startup) -> bool {
+        false
+    }
 }
 
 struct LoginWindow<V> {
@@ -625,6 +687,7 @@ impl<S: Shell> App<S> {
                     self.on_login(&name, generation, result, &username, password, remember)
                 }
                 Event::Found { name, generation, page } => self.on_found(&name, generation, page),
+                Event::LoggedIn { name, logged_in, result } => self.on_logged_in(&name, logged_in, result),
             }
         }
         if !self.exiting {
@@ -741,6 +804,9 @@ impl<S: Shell> App<S> {
 
     // The first list: what to show, depending on who started the app
     fn started(&mut self, startup: Startup) {
+        if self.shell.show_main(startup) {
+            return;
+        }
         if self.service == ServiceState::Unavailable {
             self.notify(&strings::service_unavailable(), true, None);
             return;
@@ -905,6 +971,7 @@ impl<S: Shell> App<S> {
                 if previous != Session::NotRequired {
                     log!("{}: no login needed", name);
                 }
+                tunnel.unreachable_since = None;
                 tunnel.session = Session::NotRequired;
                 tunnel.next_check = now + POLL_NOT_REQUIRED;
                 close_window = true;
@@ -916,9 +983,11 @@ impl<S: Shell> App<S> {
                 if previous != Session::Unreachable {
                     log!("{}: no answer from the login page: {}", name, result);
                 }
+                tunnel.unreachable_since.get_or_insert(now);
                 tunnel.session = Session::Unreachable;
                 tunnel.next_check = now + if fast { RETRY_CONNECTING } else { RETRY_UNREACHABLE };
             } else {
+                tunnel.unreachable_since = None;
                 let server = result.get_str("server");
                 if !server.is_empty() {
                     tunnel.server_name = server.to_string();
@@ -1005,6 +1074,45 @@ impl<S: Shell> App<S> {
         }
         if submit {
             self.submit_tunnel(&name);
+        }
+        self.sync_routes(&name);
+    }
+
+    // The service keeps the routes to the internet and the DNS servers of a tunnel with a login page until the
+    // login, and takes them back when the session ends: what the login page said, one request at a time
+    fn sync_routes(&mut self, name: &str) {
+        let Some(index) = self.tunnel_index(name) else { return };
+        let tunnel = &mut self.tunnels[index];
+        if tunnel.info.login.is_none() || tunnel.page.is_none() || !tunnel.info.up || tunnel.stopping {
+            return;
+        }
+        let Some(wanted) = tunnel.wants_after_login(Instant::now()) else { return };
+        if wanted == tunnel.info.logged_in || tunnel.routes_asked.is_some() {
+            return;
+        }
+        tunnel.routes_asked = Some(wanted);
+        let name = name.to_string();
+        self.spawn(move || {
+            let result = ipc::call(&Request::LoggedIn { name: name.clone(), logged_in: wanted });
+            Event::LoggedIn { name, logged_in: wanted, result }
+        });
+    }
+
+    fn on_logged_in(&mut self, name: &str, logged_in: bool, result: Result<Response, CallError>) {
+        let Some(index) = self.tunnel_index(name) else { return };
+        let tunnel = &mut self.tunnels[index];
+        tunnel.routes_asked = None;
+        match outcome(&result) {
+            Ok(()) => {
+                tunnel.info.logged_in = logged_in;
+                // the session changed meanwhile
+                self.sync_routes(name);
+            }
+            // again at the next status
+            Err(message) => {
+                let state = if logged_in { "off" } else { "on" };
+                log!("{}: the routes of after the login stay {}: {}", name, state, message);
+            }
         }
     }
 
@@ -1217,6 +1325,7 @@ impl<S: Shell> App<S> {
                 let text = strings::notice_logged_in(&tunnel.title(), &tunnel.user, &until);
                 self.close_window(name);
                 self.notify(&text, false, None);
+                self.sync_routes(name);
             } else {
                 self.close_window(name);
             }
@@ -1234,6 +1343,7 @@ impl<S: Shell> App<S> {
                 let tunnel = &mut self.tunnels[index];
                 tunnel.session = state;
                 tunnel.next_check = now + POLL_REFUSED;
+                self.sync_routes(name);
             }
         }
     }
@@ -1273,6 +1383,9 @@ impl<S: Shell> App<S> {
 
     // The user started the app, which was running: what they likely want
     pub fn show_from_user(&mut self) {
+        if self.shell.show_main(Startup::Normal) {
+            return;
+        }
         if self.show_pending() {
             return;
         }
@@ -1305,6 +1418,19 @@ impl<S: Shell> App<S> {
         let tunnel = &mut self.tunnels[index];
         tunnel.stopping = tunnel.info.up;
         tunnel.session_page()
+    }
+
+    // the service renamed it, while it was off: what the app keeps of it follows
+    pub fn renamed(&mut self, name: &str, new_name: &str) {
+        if let Some(page) = settings::found_page(name) {
+            settings::set_found_page(new_name, Some(&page));
+            settings::set_found_page(name, None);
+        }
+        self.details.retain(|window| window.tunnel != name);
+        if let Some(index) = self.tunnel_index(name) {
+            self.tunnels[index].info.name = new_name.to_string();
+        }
+        self.list_soon();
     }
 
     pub fn removed(&mut self, name: &str) {
@@ -1369,6 +1495,9 @@ impl<S: Shell> App<S> {
     }
 
     pub fn menu(&self) -> Vec<MenuItem> {
+        if self.shell.has_main() {
+            return self.short_menu();
+        }
         let mut items = Vec::new();
         let mut has_default = false;
         let mut action = |text: &str, command: Command, wanted: bool| {
@@ -1415,6 +1544,31 @@ impl<S: Shell> App<S> {
         items.push(MenuItem::Submenu { text: strings::MENU_LOGS.to_string(), items: logs });
         items.push(MenuItem::Label(strings::menu_version(VERSION)));
         items.push(MenuItem::Separator);
+        items.push(action(strings::MENU_QUIT, Command::Quit, false));
+        items
+    }
+
+    // With a main window: the window, a line for each VPN to turn it on and off, adding one and quitting. The
+    // details, the removal, the logs and the version are in the window.
+    fn short_menu(&self) -> Vec<MenuItem> {
+        let action = |text: &str, command: Command, default: bool| MenuItem::Action { text: text.to_string(), command, default };
+        let mut items = vec![action(&strings::menu_open(), Command::Open, true), MenuItem::Separator];
+        if self.service == ServiceState::Unavailable {
+            items.push(MenuItem::Label(strings::MENU_SERVICE_DOWN.to_string()));
+            items.push(action(strings::MENU_START_SERVICE, Command::StartService, false));
+            items.push(MenuItem::Separator);
+        } else if !self.tunnels.is_empty() {
+            let all: Vec<MenuItem> = self.tunnels.iter().map(switch_item).collect();
+            if all.len() <= MENU_SWITCHES {
+                items.extend(all);
+            } else {
+                let busy = |tunnel: &&Tunnel| tunnel.info.up || tunnel.connecting() || tunnel.stopping;
+                items.extend(self.tunnels.iter().filter(busy).map(switch_item));
+                items.push(MenuItem::Submenu { text: strings::MENU_ALL_VPNS.to_string(), items: all });
+            }
+            items.push(MenuItem::Separator);
+        }
+        items.push(action(strings::MENU_IMPORT, Command::Import, false));
         items.push(action(strings::MENU_QUIT, Command::Quit, false));
         items
     }
@@ -1495,6 +1649,8 @@ mod tests {
     struct FakeShell {
         journal: Journal,
         next_id: usize,
+        // a system with a main window
+        main: bool,
     }
 
     impl Shell for FakeShell {
@@ -1522,11 +1678,18 @@ mod tests {
         fn import_later(&mut self) {
             self.journal.borrow_mut().push("import".into());
         }
+        fn has_main(&self) -> bool {
+            self.main
+        }
+        fn show_main(&mut self, startup: Startup) -> bool {
+            self.journal.borrow_mut().push(format!("main {:?}", startup));
+            self.main
+        }
     }
 
     fn app() -> (App<FakeShell>, Journal) {
         let journal = Journal::default();
-        let shell = FakeShell { journal: journal.clone(), next_id: 0 };
+        let shell = FakeShell { journal: journal.clone(), next_id: 0, main: false };
         (App::new(shell, Startup::SignIn), journal)
     }
 
@@ -1602,6 +1765,43 @@ mod tests {
     }
 
     #[test]
+    fn the_routes_of_after_the_login() {
+        let (mut app, _) = app();
+        office_on(&mut app);
+        let generation = app.tunnels[0].generation;
+        let logged_in = r#"{"authenticated":true,"otp_required":false,"user":"alice","expires":"2099-01-01T00:00:00+00:00"}"#;
+        let not_logged_in = r#"{"authenticated":false,"otp_required":false}"#;
+        // not logged in yet: off, as the service turned the tunnel on
+        app.on_status("Office", generation, status(not_logged_in));
+        assert_eq!(app.tunnels[0].routes_asked, None);
+        // logged in: on, asked once
+        app.on_status("Office", generation, status(logged_in));
+        assert_eq!(app.tunnels[0].routes_asked, Some(true));
+        app.on_status("Office", generation, status(logged_in));
+        app.on_logged_in("Office", true, Ok(Response::success()));
+        assert_eq!((app.tunnels[0].info.logged_in, app.tunnels[0].routes_asked), (true, None));
+        // the session ended: off
+        app.on_status("Office", generation, status(not_logged_in));
+        assert_eq!(app.tunnels[0].routes_asked, Some(false));
+        app.on_logged_in("Office", false, Ok(Response::success()));
+        // refused by the service: again at the next status, not before
+        app.on_status("Office", generation, status(logged_in));
+        app.on_logged_in("Office", true, Ok(Response::failure(ipc::FAILED, "can't add the route to 0.0.0.0/0")));
+        assert_eq!((app.tunnels[0].info.logged_in, app.tunnels[0].routes_asked), (false, None));
+        app.on_status("Office", generation, status(logged_in));
+        app.on_logged_in("Office", true, Ok(Response::success()));
+        // the login page stops answering: on for a while, then off until it answers again
+        app.on_status("Office", generation, ApiResult::default());
+        assert_eq!(app.tunnels[0].routes_asked, None);
+        app.tunnels[0].unreachable_since = Instant::now().checked_sub(UNREACHABLE_ROUTES);
+        app.on_status("Office", generation, ApiResult::default());
+        assert_eq!(app.tunnels[0].routes_asked, Some(false));
+        app.on_logged_in("Office", false, Ok(Response::success()));
+        app.on_status("Office", generation, status(logged_in));
+        assert_eq!((app.tunnels[0].routes_asked, app.tunnels[0].unreachable_since), (Some(true), None));
+    }
+
+    #[test]
     fn refusals_of_the_login() {
         let failure = |status: u16, json: &str| {
             let mut result = super::tests::status(json);
@@ -1614,6 +1814,122 @@ mod tests {
         assert_eq!(failure(403, r#"{"error":"forbidden"}"#), strings::ERROR_FORBIDDEN);
         assert_eq!(failure(429, r#"{"retry_after":61}"#), strings::error_attempts(2));
         assert_eq!(error_message(&ApiResult::default()), strings::ERROR_UNREACHABLE);
+    }
+
+    #[test]
+    fn the_cards() {
+        let (mut app, _) = app();
+        office_on(&mut app);
+        let generation = app.tunnels[0].generation;
+        let card = &app.overview().cards[0];
+        assert_eq!((card.name.as_str(), card.on, card.can_switch, card.tone), ("Office", true, true, overview::Tone::Busy));
+        assert_eq!(card.state, "Connecting...");
+        assert_eq!(card.routing, "Only these networks go through the VPN: 10.103.1.0/24.");
+        let routes = |texts: &[&str]| overview::card(&{
+            let mut tunnel = Tunnel::new("Lab");
+            tunnel.info.routes = texts.iter().map(|text| text.to_string()).collect();
+            tunnel
+        })
+        .routing;
+        assert_eq!(routes(&["0.0.0.0/0", "::/0"]), strings::HOME_ROUTING_FULL);
+        assert_eq!(routes(&["0.0.0.0/1", "128.0.0.0/1", "fd00::/64"]), "All the IPv4 traffic goes through the VPN, and the IPv6 networks fd00::/64.");
+        assert_eq!(routes(&["0.0.0.0/0"]), "All the IPv4 traffic goes through the VPN, not the IPv6 traffic.");
+        assert_eq!(routes(&[]), strings::HOME_ROUTING_NONE);
+        let traffic = card.traffic.as_ref().unwrap();
+        assert_eq!(traffic.address, "");
+        // logged in: good, with the user and the name of the server
+        app.on_status(
+            "Office",
+            generation,
+            status(r#"{"authenticated":true,"otp_required":false,"user":"alice","server":"HQ","expires":"2099-01-01T00:00:00+00:00"}"#),
+        );
+        let card = &app.overview().cards[0];
+        assert_eq!((card.tone, card.user.as_str(), card.server.as_str(), card.hint.as_deref()), (overview::Tone::Good, "alice", "HQ", None));
+        assert!(card.state.starts_with("Connected as alice until "), "{}", card.state);
+        // refused: bad, and what to do
+        app.tunnels[0].busy = true;
+        app.on_status("Office", generation, status(r#"{"authenticated":false,"otp_required":true,"no_otp":true}"#));
+        let card = &app.overview().cards[0];
+        assert_eq!((card.tone, card.hint.as_deref()), (overview::Tone::Bad, Some(strings::ERROR_NO_OTP)));
+        // turning off: the switch is off and waits
+        app.disconnect("Office");
+        let card = &app.overview().cards[0];
+        assert_eq!((card.on, card.can_switch, card.tone), (false, false, overview::Tone::Busy));
+        // off after a failure: why
+        app.tunnels[0].stopping = false;
+        app.tunnels[0].set_off();
+        app.tunnels[0].info.up = false;
+        app.tunnels[0].error = Some("the driver refused".into());
+        let card = &app.overview().cards[0];
+        assert_eq!((card.tone, card.traffic.is_some()), (overview::Tone::Bad, false));
+        assert_eq!(card.hint.as_deref(), Some("Can't connect: the driver refused"));
+    }
+
+    #[test]
+    fn the_main_window_instead() {
+        // a system with a main window opens it, at the start and when the user starts the app again
+        let (mut app, journal) = super::tests::app();
+        app.shell.main = true;
+        let response = Response { ok: true, ..Response::default() };
+        app.on_list(Instant::now(), Ok(response));
+        assert!(journal.borrow().contains(&"main SignIn".to_string()));
+        // no balloon: the window says it
+        assert!(!journal.borrow().iter().any(|line| line.starts_with("notify")));
+        app.show_from_user();
+        assert!(journal.borrow().contains(&"main Normal".to_string()));
+        assert!(!journal.borrow().contains(&"import".to_string()));
+        assert_eq!(app.menu()[0], MenuItem::Action { text: strings::menu_open(), command: Command::Open, default: true });
+        // without one: the balloon, and the menu as it was
+        let (mut plain, journal) = super::tests::app();
+        plain.on_list(Instant::now(), Ok(Response { ok: true, ..Response::default() }));
+        assert!(journal.borrow().iter().any(|line| line.starts_with("notify")));
+    }
+
+    #[test]
+    fn the_short_menu() {
+        let (mut app, _) = super::tests::app();
+        app.shell.main = true;
+        office_on(&mut app);
+        let action = |text: &str, command: Command, default: bool| MenuItem::Action { text: text.into(), command, default };
+        let switch = |name: &str, state: &str, on: bool, command: Option<Command>| MenuItem::Switch {
+            name: name.into(),
+            state: state.into(),
+            on,
+            command,
+        };
+        // the window, the VPNs, adding one and quitting: the rest is in the window
+        let generation = app.tunnels[0].generation;
+        app.on_status("Office", generation, status(r#"{"authenticated":false,"otp_required":false}"#));
+        assert_eq!(
+            app.menu(),
+            [
+                action(&strings::menu_open(), Command::Open, true),
+                MenuItem::Separator,
+                switch("Office", strings::MENU_LOG_IN, true, Some(Command::LogIn("Office".into()))),
+                MenuItem::Separator,
+                action(strings::MENU_IMPORT, Command::Import, false),
+                action(strings::MENU_QUIT, Command::Quit, false),
+            ]
+        );
+        let logged_in = r#"{"authenticated":true,"otp_required":false,"user":"alice","expires":"2099-01-01T00:00:00+00:00"}"#;
+        app.on_status("Office", generation, status(logged_in));
+        assert_eq!(app.menu()[2], switch("Office", strings::STATE_CONNECTED, true, Some(Command::Disconnect("Office".into()))));
+        app.disconnect("Office");
+        assert_eq!(app.menu()[2], switch("Office", strings::STATE_DISCONNECTING, false, None));
+        app.on_down("Office", Ok(Response::success()));
+        assert_eq!(app.menu()[2], switch("Office", "", false, Some(Command::Connect("Office".into()))));
+
+        // many VPNs: the ones on stay, all of them in a submenu
+        let names: Vec<String> = (1..=MENU_SWITCHES + 1).map(|n| format!("VPN {:02}", n)).collect();
+        let infos = names
+            .iter()
+            .map(|name| TunnelInfo { name: name.clone(), up: name == "VPN 03", since: unix_now(), ..TunnelInfo::default() })
+            .collect();
+        app.on_list(Instant::now(), Ok(Response { ok: true, tunnels: infos, ..Response::default() }));
+        let menu = app.menu();
+        assert!(matches!(&menu[2], MenuItem::Switch { name, on: true, .. } if name == "VPN 03"));
+        assert!(matches!(&menu[3], MenuItem::Submenu { text, items } if text == strings::MENU_ALL_VPNS && items.len() == names.len()));
+        assert_eq!(menu.len(), 7);
     }
 
     #[test]

@@ -3,9 +3,10 @@
 use std::ptr;
 
 use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS};
+use windows_sys::Win32::Storage::FileSystem::DELETE;
 use windows_sys::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegDeleteValueW, RegEnumKeyExW, RegGetValueW, RegOpenKeyExW,
-    RegSetValueExW, HKEY, KEY_READ, KEY_WRITE, REG_BINARY, REG_DWORD, REG_OPTION_NON_VOLATILE, REG_SZ, RRF_RT_REG_BINARY,
+    RegRenameKey, RegSetValueExW, HKEY, KEY_READ, KEY_WRITE, REG_BINARY, REG_DWORD, REG_OPTION_NON_VOLATILE, REG_SZ, RRF_RT_REG_BINARY,
     RRF_RT_REG_DWORD, RRF_RT_REG_SZ,
 };
 
@@ -123,6 +124,7 @@ impl Key {
         unsafe { RegDeleteValueW(self.0, wide(name).as_ptr()) };
     }
 
+
     pub fn subkeys(&self) -> Vec<String> {
         let mut names = Vec::new();
         for index in 0.. {
@@ -152,6 +154,17 @@ impl Key {
 impl Drop for Key {
     fn drop(&mut self) {
         unsafe { RegCloseKey(self.0) };
+    }
+}
+
+// A key under another name in the same place, with all that's in it: the name only, not a path
+pub fn rename(root: HKEY, path: &str, new_name: &str) -> Result<(), String> {
+    let key = Key::open_with(root, path, KEY_READ | KEY_WRITE | DELETE).ok_or_else(|| format!("can't open the registry key {}", path))?;
+    let result = unsafe { RegRenameKey(key.0, ptr::null(), wide(new_name).as_ptr()) };
+    if result == ERROR_SUCCESS {
+        Ok(())
+    } else {
+        Err(format!("can't rename the registry key {}: {}", path, error_message(result)))
     }
 }
 

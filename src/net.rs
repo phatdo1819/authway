@@ -1,5 +1,6 @@
 // The addresses, routes and DNS servers of a tunnel adapter, as the example of WireGuardNT sets them. They go away
-// with the adapter. And the connections that must go out through it only.
+// with the adapter; the routes and DNS servers that wait for the login come and go with it. And the connections that
+// must go out through it only.
 
 use std::io;
 use std::mem::{size_of, zeroed};
@@ -13,7 +14,7 @@ use windows_sys::core::GUID;
 use windows_sys::Win32::Foundation::{ERROR_NOT_FOUND, ERROR_OBJECT_ALREADY_EXISTS, NO_ERROR};
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     ConvertInterfaceLuidToGuid, ConvertInterfaceLuidToIndex, CreateIpForwardEntry2, CreateUnicastIpAddressEntry,
-    GetBestInterfaceEx, GetIpInterfaceEntry, GetUnicastIpAddressEntry, InitializeIpForwardEntry,
+    DeleteIpForwardEntry2, GetBestInterfaceEx, GetIpInterfaceEntry, GetUnicastIpAddressEntry, InitializeIpForwardEntry,
     InitializeIpInterfaceEntry, InitializeUnicastIpAddressEntry, SetInterfaceDnsSettings, SetIpInterfaceEntry,
     DNS_INTERFACE_SETTINGS, DNS_INTERFACE_SETTINGS_VERSION1, DNS_SETTING_IPV6, DNS_SETTING_NAMESERVER,
     DNS_SETTING_SEARCHLIST, MIB_IPFORWARD_ROW2, MIB_IPINTERFACE_ROW, MIB_UNICASTIPADDRESS_ROW,
@@ -36,21 +37,41 @@ const MIN_IPV6_MTU: u32 = 1280;
 // IPv6, UDP and WireGuard
 const OVERHEAD: u32 = 80;
 
-pub fn configure(luid: u64, config: &Config, mtu: u32) -> Result<(), String> {
+// the routes of before the login, and the DNS servers unless they wait for it (see manager::Steps)
+pub fn configure(luid: u64, config: &Config, routes: &[IpNet], dns: bool, mtu: u32) -> Result<(), String> {
     let luid = NET_LUID_LH { Value: luid };
-    for net in config.routes() {
-        add_route(&luid, &net)?;
+    for net in routes {
+        add_route(&luid, net)?;
     }
     for net in &config.addresses {
         add_address(&luid, net)?;
     }
     set_interface(&luid, AF_INET, mtu)?;
     set_interface(&luid, AF_INET6, mtu)?;
-    set_dns(&luid, config)
+    if !dns {
+        return Ok(());
+    }
+    set_dns(&luid, &config.dns, &config.dns_search)
 }
 
-fn add_route(luid: &NET_LUID_LH, net: &IpNet) -> Result<(), String> {
-    let network = net.network();
+// The routes and the DNS servers that wait for the login: on with it, off again when the session ends, all of them
+// even when one fails
+pub fn after_login(luid: u64, routes: &[IpNet], dns: &[IpAddr], search: &[String], on: bool) -> Result<(), String> {
+    let luid = NET_LUID_LH { Value: luid };
+    if on {
+        for net in routes {
+            add_route(&luid, net)?;
+        }
+        return set_dns(&luid, dns, search);
+    }
+    let mut result = Ok(());
+    for net in routes {
+        result = result.and(delete_route(&luid, net));
+    }
+    result.and(clear_dns(&luid, dns, search))
+}
+
+fn route_row(luid: &NET_LUID_LH, network: &IpNet) -> MIB_IPFORWARD_ROW2 {
     let mut row: MIB_IPFORWARD_ROW2 = unsafe { zeroed() };
     unsafe { InitializeIpForwardEntry(&mut row) };
     row.InterfaceLuid = *luid;
@@ -60,9 +81,23 @@ fn add_route(luid: &NET_LUID_LH, net: &IpNet) -> Result<(), String> {
     let any: IpAddr = if network.addr.is_ipv4() { [0u8; 4].into() } else { [0u8; 16].into() };
     row.NextHop = ip_sockaddr(any);
     row.Metric = 0;
-    let result = unsafe { CreateIpForwardEntry2(&row) };
+    row
+}
+
+fn add_route(luid: &NET_LUID_LH, net: &IpNet) -> Result<(), String> {
+    let network = net.network();
+    let result = unsafe { CreateIpForwardEntry2(&route_row(luid, &network)) };
     if result != NO_ERROR && result != ERROR_OBJECT_ALREADY_EXISTS {
         return Err(format!("can't add the route to {}: {}", network, error_message(result)));
+    }
+    Ok(())
+}
+
+fn delete_route(luid: &NET_LUID_LH, net: &IpNet) -> Result<(), String> {
+    let network = net.network();
+    let result = unsafe { DeleteIpForwardEntry2(&route_row(luid, &network)) };
+    if result != NO_ERROR && result != ERROR_NOT_FOUND {
+        return Err(format!("can't remove the route to {}: {}", network, error_message(result)));
     }
     Ok(())
 }
@@ -115,41 +150,73 @@ fn set_interface(luid: &NET_LUID_LH, family: ADDRESS_FAMILY, mtu: u32) -> Result
     Ok(())
 }
 
-fn set_dns(luid: &NET_LUID_LH, config: &Config) -> Result<(), String> {
-    if config.dns.is_empty() && config.dns_search.is_empty() {
-        return Ok(());
+// For each version of IP: whether it's IPv6, the servers and the search domains, which go with the servers of IPv4,
+// or of IPv6 when there are none
+fn dns_settings(dns: &[IpAddr], search: &[String]) -> Vec<(bool, String, String)> {
+    if dns.is_empty() && search.is_empty() {
+        return Vec::new();
     }
+    let join = |ipv4: bool| -> String {
+        let servers: Vec<String> = dns.iter().filter(|addr| addr.is_ipv4() == ipv4).map(|addr| addr.to_string()).collect();
+        servers.join(",")
+    };
+    let search = search.join(",");
+    let ipv4 = join(true);
+    let ipv6 = join(false);
+    let search_with_ipv6 = ipv4.is_empty() && !ipv6.is_empty();
+    let mut settings = Vec::new();
+    if !ipv4.is_empty() || !search_with_ipv6 {
+        settings.push((false, ipv4, if search_with_ipv6 { String::new() } else { search.clone() }));
+    }
+    if !ipv6.is_empty() {
+        settings.push((true, ipv6, if search_with_ipv6 { search } else { String::new() }));
+    }
+    settings
+}
+
+fn adapter_guid(luid: &NET_LUID_LH) -> Result<GUID, String> {
     let mut guid: GUID = unsafe { zeroed() };
     let result = unsafe { ConvertInterfaceLuidToGuid(luid, &mut guid) };
     if result != NO_ERROR {
         return Err(format!("can't find the network adapter: {}", error_message(result)));
     }
-    let join = |ipv4: bool| -> String {
-        let servers: Vec<String> = config.dns.iter().filter(|addr| addr.is_ipv4() == ipv4).map(|addr| addr.to_string()).collect();
-        servers.join(",")
-    };
-    let search = config.dns_search.join(",");
-    let ipv4 = join(true);
-    let ipv6 = join(false);
-    // the search domains go with the servers of IPv4, or of IPv6 when there are none
-    let search_with_ipv6 = ipv4.is_empty() && !ipv6.is_empty();
-    if !ipv4.is_empty() || !search_with_ipv6 {
-        apply_dns(&guid, false, &ipv4, if search_with_ipv6 { "" } else { &search })?;
+    Ok(guid)
+}
+
+fn set_dns(luid: &NET_LUID_LH, dns: &[IpAddr], search: &[String]) -> Result<(), String> {
+    let settings = dns_settings(dns, search);
+    if settings.is_empty() {
+        return Ok(());
     }
-    if !ipv6.is_empty() {
-        apply_dns(&guid, true, &ipv6, if search_with_ipv6 { &search } else { "" })?;
+    let guid = adapter_guid(luid)?;
+    for (ipv6, servers, search) in &settings {
+        apply_dns(&guid, *ipv6, servers, (!search.is_empty()).then_some(search.as_str()))?;
     }
     Ok(())
 }
 
-fn apply_dns(guid: &GUID, ipv6: bool, servers: &str, search: &str) -> Result<(), String> {
+// the ones that set_dns set, empty again
+fn clear_dns(luid: &NET_LUID_LH, dns: &[IpAddr], search: &[String]) -> Result<(), String> {
+    let settings = dns_settings(dns, search);
+    if settings.is_empty() {
+        return Ok(());
+    }
+    let guid = adapter_guid(luid)?;
+    for (ipv6, _, search) in &settings {
+        apply_dns(&guid, *ipv6, "", (!search.is_empty()).then_some(""))?;
+    }
+    Ok(())
+}
+
+// the search domains only when given, an empty list for none
+fn apply_dns(guid: &GUID, ipv6: bool, servers: &str, search: Option<&str>) -> Result<(), String> {
     let mut servers = crate::win::wide(servers);
-    let mut search_list = crate::win::wide(search);
+    let mut search_list = crate::win::wide(search.unwrap_or(""));
     let mut settings: DNS_INTERFACE_SETTINGS = unsafe { zeroed() };
     settings.Version = DNS_INTERFACE_SETTINGS_VERSION1;
     settings.Flags = DNS_SETTING_NAMESERVER as u64;
     settings.NameServer = servers.as_mut_ptr();
-    if !search.is_empty() {
+    if search.is_some() {
         settings.Flags |= DNS_SETTING_SEARCHLIST as u64;
         settings.SearchList = search_list.as_mut_ptr();
     } else {
@@ -343,6 +410,19 @@ mod tests {
         assert_eq!(&data, b"pong");
         assert!(has_address(loopback(), IpAddr::V4(Ipv4Addr::LOCALHOST)));
         assert!(!has_address(loopback(), "192.0.2.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn dns_of_each_version() {
+        let addrs = |texts: &[&str]| texts.iter().map(|text| text.parse().unwrap()).collect::<Vec<IpAddr>>();
+        let search = vec!["corp.example".to_string()];
+        assert!(dns_settings(&[], &[]).is_empty());
+        assert_eq!(
+            dns_settings(&addrs(&["10.103.1.1", "fd00::1", "10.103.1.2"]), &search),
+            [(false, "10.103.1.1,10.103.1.2".into(), "corp.example".into()), (true, "fd00::1".into(), String::new())]
+        );
+        assert_eq!(dns_settings(&addrs(&["fd00::1"]), &search), [(true, "fd00::1".into(), "corp.example".into())]);
+        assert_eq!(dns_settings(&[], &search), [(false, String::new(), "corp.example".into())]);
     }
 
     #[test]

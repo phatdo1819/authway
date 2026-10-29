@@ -78,6 +78,11 @@ pub fn save(name: &str, text: &str) -> Result<Stored, String> {
     Ok(Stored { name: name.to_string(), text: text.to_string(), id: Id })
 }
 
+// in place, the case alone too
+pub fn rename(name: &str, new_name: &str) -> Result<(), String> {
+    fs::rename(path(name), path(new_name)).map_err(|error| error.to_string())
+}
+
 pub fn delete(name: &str) -> Result<(), String> {
     match fs::remove_file(path(name)) {
         Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.to_string()),

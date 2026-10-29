@@ -115,6 +115,16 @@ pub fn sign(tunnel: &str, _id: &store::Id, data: &[u8]) -> Result<Vec<u8>, Strin
         .map_err(|error| format!("the login can't be signed: {}", error))
 }
 
+// with its tunnel, which stays enrolled
+pub fn rename(tunnel: &str, new_name: &str, _id: &store::Id) {
+    match fs::rename(path(tunnel), path(new_name)) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            log!("{}: can't rename the device key: {}", tunnel, error)
+        }
+        _ => {}
+    }
+}
+
 // with its tunnel: a new tunnel of the same name gets a new key, enrolled again
 pub fn delete(tunnel: &str, _id: &store::Id) {
     match fs::remove_file(path(tunnel)) {

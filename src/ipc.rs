@@ -42,6 +42,11 @@ pub enum Request {
     Down { name: String },
     Import { name: String, config: String, #[serde(default)] replace: bool },
     Remove { name: String },
+    // while it's off: its device key and its login stay
+    Rename { name: String, new_name: String },
+    // the user logged in on the login page, or the session ended: the routes and the DNS servers that wait for the
+    // login go on, or off again
+    LoggedIn { name: String, logged_in: bool },
     // the device proof of a login on the page at `host`, see device.rs
     Sign {
         name: String,
@@ -113,6 +118,12 @@ pub struct TunnelInfo {
     pub addresses: Vec<String>,
     #[serde(default)]
     pub routes: Vec<String>,
+    // with a login page: the routes to the internet, which wait for the login; its DNS servers wait too
+    #[serde(default)]
+    pub after_login: Vec<String>,
+    // while it's on: the app said the user logged in, the routes and the DNS servers of after the login are on
+    #[serde(default)]
+    pub logged_in: bool,
     // the index of the network adapter of the tunnel while it's on, 0 else: the requests to the login page go out
     // only through it
     #[serde(default)]

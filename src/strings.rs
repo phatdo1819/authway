@@ -32,6 +32,12 @@ pub const MENU_NO_TUNNELS: &str = "No VPN yet: add the file of your administrato
 pub const MENU_SERVICE_DOWN: &str = "The VPN service isn't running";
 pub const MENU_START_SERVICE: &str = "Start the VPN service";
 pub const MENU_DETAILS: &str = "Details...";
+pub const MENU_OPEN_AT_SIGN_IN: &str = "Open the window at sign-in";
+pub const MENU_ALL_VPNS: &str = "All the VPNs";
+
+pub fn menu_open() -> String {
+    format!("Open {}", PRODUCT)
+}
 
 pub fn menu_version(version: &str) -> String {
     format!("Version {}", version)
@@ -184,6 +190,10 @@ pub fn remove_needs_admin() -> String {
     format!("Only an administrator can remove a VPN from this computer. {}", ADMIN_PROMPT)
 }
 
+pub fn rename_failed(error: &str) -> String {
+    format!("Can't rename the VPN:\n\n{}", error)
+}
+
 pub fn quit_confirm() -> String {
     format!("Disconnect the VPN and quit {}?", PRODUCT)
 }
@@ -237,6 +247,7 @@ pub const DETAIL_HANDSHAKE: &str = "Last handshake";
 pub const DETAIL_RECEIVED: &str = "Received";
 pub const DETAIL_SENT: &str = "Sent";
 pub const DETAIL_MODE: &str = "Mode";
+pub const DETAIL_BEFORE_LOGIN: &str = "Before the login";
 pub const DETAIL_ADDRESS: &str = "Address";
 pub const DETAIL_DNS: &str = "DNS servers";
 pub const DETAIL_DNS_SEARCH: &str = "DNS search domains";
@@ -266,6 +277,11 @@ pub const VALUE_NOT_YET: &str = "Not yet";
 pub const VALUE_DNS_NONE: &str = "None: the ones of the network of the computer";
 pub const VALUE_ONE_ADDRESS: &str = "One address";
 pub const VALUE_IPV6_NETWORK: &str = "IPv6 network";
+pub const VALUE_BEFORE_LOGIN: &str = "Only the login page and the private networks";
+
+pub fn value_dns_after_login(servers: &str) -> String {
+    format!("{} (after the login)", servers)
+}
 
 pub fn value_keepalive(seconds: u16) -> String {
     format!("Every {} seconds", seconds)
@@ -313,6 +329,92 @@ pub fn value_default_route(ipv6: bool) -> String {
     format!("Default route: all the {} addresses", if ipv6 { "IPv6" } else { "IPv4" })
 }
 
+// the main window, where the system has one
+pub const HOME_ADD: &str = "Add VPN";
+pub const HOME_MORE: &str = "More";
+pub const HOME_BACK: &str = "Back";
+pub const HOME_EMPTY_TITLE: &str = "No VPN yet";
+pub const HOME_EMPTY_TEXT: &str = "Add the .conf file that your administrator gave you, or drop it on this window.";
+pub const HOME_EMPTY_ADD: &str = "Add a VPN from its file";
+pub const HOME_START_SERVICE: &str = "Start it";
+pub const HOME_LOG_IN: &str = "Log in";
+pub const HOME_DROP: &str = "Drop the file to add the VPN";
+pub const HOME_TRAFFIC: &str = "Traffic";
+pub const HOME_TRAFFIC_OFF: &str = "Connect to see the traffic of this VPN.";
+pub const HOME_DOWNLOAD: &str = "Download";
+pub const HOME_UPLOAD: &str = "Upload";
+pub const HOME_DURATION: &str = "Connected for";
+pub const HOME_ADDRESS: &str = "Address in the VPN";
+pub const HOME_SERVER: &str = "Server";
+pub const HOME_ROUTING: &str = "Routing";
+pub const HOME_ROUTING_FULL: &str = "All the traffic goes through the VPN.";
+pub const HOME_ROUTING_NONE: &str = "No traffic goes through the VPN.";
+pub const HOME_ROUTING_BEFORE_LOGIN: &str =
+    "Until you log in, the internet goes through your own connection, not through the VPN.";
+pub const HOME_SETTINGS: &str = "Settings";
+pub const HOME_NAME: &str = "Name";
+pub const HOME_RENAME_OFF: &str = "Disconnect the VPN to rename it.";
+pub const HOME_USERNAME: &str = "Username";
+pub const HOME_PASSWORD_SAVED: &str = "Your password is saved on this computer.";
+pub const HOME_PASSWORD_NOT_SAVED: &str = "Your password isn't saved: the login asks for it.";
+pub const HOME_NO_LOGIN: &str = "This VPN has no login: the file is all it needs.";
+pub const HOME_FORGET: &str = "Forget it";
+pub const HOME_SAVE: &str = "Save changes";
+pub const HOME_ALL_DETAILS: &str = "All details";
+pub const HOME_REMOVE: &str = "Remove this VPN";
+
+pub fn home_routing_split(networks: &str) -> String {
+    format!("Only these networks go through the VPN: {}.", networks)
+}
+
+// all of one version of IP; the networks of the other one, if any
+pub fn home_routing_full_one(full: &str, other: &str, networks: Option<&str>) -> String {
+    match networks {
+        Some(networks) => format!("All the {} traffic goes through the VPN, and the {} networks {}.", full, other, networks),
+        None => format!("All the {} traffic goes through the VPN, not the {} traffic.", full, other),
+    }
+}
+
+// a change of username leaves the password of the other one behind
+pub fn home_username_changed(saved: &str) -> String {
+    format!("Saving forgets the password saved for {}.", saved)
+}
+
+// the name of a switch, for the screen readers
+pub fn home_switch(name: &str, on: bool) -> String {
+    format!("{} {}", if on { MENU_DISCONNECT } else { MENU_CONNECT }, name)
+}
+
+pub fn notice_still_running() -> String {
+    format!("{} keeps running {}: open it from its icon, or quit it from its menu.", PRODUCT, PLACE)
+}
+
+pub fn value_rate(bytes_per_second: f64) -> String {
+    if bytes_per_second < 1024.0 {
+        return format!("{:.0} B/s", bytes_per_second);
+    }
+    let mut value = bytes_per_second / 1024.0;
+    let mut unit = "KB/s";
+    for next in ["MB/s", "GB/s"] {
+        if value < 1024.0 {
+            break;
+        }
+        value /= 1024.0;
+        unit = next;
+    }
+    format!("{:.1} {}", value, unit)
+}
+
+// 12:34, or 1:02:03
+pub fn value_duration(seconds: u64) -> String {
+    let (hours, minutes, seconds) = (seconds / 3600, seconds / 60 % 60, seconds % 60);
+    if hours > 0 {
+        format!("{}:{:02}:{:02}", hours, minutes, seconds)
+    } else {
+        format!("{}:{:02}", minutes, seconds)
+    }
+}
+
 // what goes through the VPN
 pub const ROUTING_FULL: &str = "Full tunnel: all the traffic";
 pub const ROUTING_SPLIT: &str = "Split tunnel: only the networks below";
@@ -324,5 +426,21 @@ pub fn routing_full_one(full: &str, other: &str, other_routed: bool) -> String {
         format!("Full tunnel for {}, {} only to the networks below", full, other)
     } else {
         format!("Full tunnel for {}, no {}", full, other)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn numbers() {
+        assert_eq!(value_rate(0.0), "0 B/s");
+        assert_eq!(value_rate(1000.0), "1000 B/s");
+        assert_eq!(value_rate(1536.0), "1.5 KB/s");
+        assert_eq!(value_rate(3.5 * 1024.0 * 1024.0), "3.5 MB/s");
+        assert_eq!(value_duration(0), "0:00");
+        assert_eq!(value_duration(754), "12:34");
+        assert_eq!(value_duration(3723), "1:02:03");
     }
 }

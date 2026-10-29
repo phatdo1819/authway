@@ -75,6 +75,10 @@ fn main() {
             Some(name) => flows::remove_command(name),
             None => 2,
         },
+        Some("--rename") => match (arguments.get(1), value(&arguments, "--to")) {
+            (Some(name), Some(new_name)) => flows::rename_command(name, &new_name),
+            _ => 2,
+        },
         #[cfg(windows)]
         Some("--quit") => flows::quit_command(),
         // at every sign-in, and after the setup
@@ -105,5 +109,6 @@ mod tests {
         // a password for nobody, or an empty username
         assert!(login(&arguments(&["--password", "x"])).is_err());
         assert!(login(&arguments(&["--username=", "--password", "x"])).is_err());
+        assert_eq!(value(&arguments(&["--rename", "Office", "--to", "Work"]), "--to").as_deref(), Some("Work"));
     }
 }

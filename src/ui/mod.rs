@@ -1,10 +1,12 @@
-// The app next to the clock, with plain Win32 windows: the state lives in one App (client/) on the thread of the
+// The app next to the clock and its main window, with plain Win32 windows: the state lives in one App (client/) on the thread of the
 // windows, reached through with_app(). The modal steps (menus, message boxes, file dialogs, UAC) run outside of
 // it, in flows.rs, so that the messages they pump find the App free.
 
 pub mod connect;
 pub mod details;
 pub mod flows;
+pub mod home;
+pub mod theme;
 pub mod tray;
 
 use std::cell::RefCell;
@@ -35,6 +37,8 @@ pub const WM_APP_TRAY: u32 = WM_APP + 2;
 pub const WM_APP_SHOW: u32 = WM_APP + 3;
 pub const WM_APP_QUIT: u32 = WM_APP + 4;
 pub const WM_APP_IMPORT: u32 = WM_APP + 5;
+// the main window, out of the App
+pub const WM_APP_HOME: u32 = WM_APP + 6;
 // the tests open the details of a tunnel by its place in the list: a menu can't be driven from outside
 #[cfg(feature = "testing")]
 pub const WM_APP_TEST_DETAILS: u32 = WM_APP + 100;

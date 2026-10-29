@@ -1,7 +1,8 @@
 // The addresses, routes and DNS servers of a tunnel on macOS, as wg-quick sets them there, with the commands of
 // macOS (plan.rs makes their arguments). The routes of the tunnel go with its interface; the route that keeps the
 // server out of the tunnel and the DNS servers are taken back when the tunnel goes off, and the DNS servers at the
-// start of the service too, if it stopped without it. And the connections that must go out through the tunnel only.
+// start of the service too, if it stopped without it. The routes and DNS servers that wait for the login come and go
+// with it. And the connections that must go out through the tunnel only.
 
 use std::ffi::{CStr, CString};
 use std::fs;
@@ -18,6 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::conf::{Config, IpNet};
 use crate::log;
+use crate::manager::Steps;
 use crate::plan::{self, Action, Gateway};
 use crate::setup;
 
@@ -203,8 +205,15 @@ static NEXT_OWNER: Mutex<u64> = Mutex::new(1);
 pub struct Network {
     interface: String,
     owner: u64,
-    // the networks of the tunnel, as its configuration has them
+    // all the networks of the tunnel, after the login too
     routes: Vec<IpNet>,
+    // the ones that wait for the login, see manager::Steps; on while logged_in
+    after: Vec<IpNet>,
+    logged_in: bool,
+    // the DNS servers and search domains of the configuration, set with the routes of after the login when dns_after
+    dns: Vec<String>,
+    dns_search: Vec<String>,
+    dns_after: bool,
     // the servers whose address the tunnel would carry: each has a route through the network
     servers: Vec<IpAddr>,
     host_routes: Vec<(IpAddr, Gateway)>,
@@ -214,16 +223,29 @@ pub struct Network {
 }
 
 impl Network {
-    pub fn configure(interface: &str, config: &Config, mtu: u32, endpoints: &[Option<SocketAddr>]) -> Result<Network, String> {
+    pub fn configure(
+        interface: &str,
+        config: &Config,
+        mtu: u32,
+        endpoints: &[Option<SocketAddr>],
+        steps: &Steps,
+    ) -> Result<Network, String> {
         let owner = {
             let mut next = NEXT_OWNER.lock().unwrap_or_else(|error| error.into_inner());
             *next += 1;
             *next
         };
+        let before = plan::tunnel_routes(&steps.before);
+        let after = plan::tunnel_routes(&steps.after).into_iter().filter(|net| !before.contains(net)).collect();
         let mut network = Network {
             interface: interface.to_string(),
             owner,
             routes: plan::tunnel_routes(&config.routes()),
+            after,
+            logged_in: false,
+            dns: config.dns.iter().map(ToString::to_string).collect(),
+            dns_search: config.dns_search.clone(),
+            dns_after: steps.dns_after,
             servers: Vec::new(),
             host_routes: Vec::new(),
             // before the routes of the tunnel
@@ -240,16 +262,39 @@ impl Network {
         for endpoint in endpoints.iter().flatten() {
             network.add_server(endpoint.ip());
         }
-        for net in network.routes.clone() {
+        for net in &before {
             // a network that the computer has already, the local one: the tunnel gets the rest
-            run_logged(ROUTE, &plan::route_args(Action::Add, &net, interface));
+            run_logged(ROUTE, &plan::route_args(Action::Add, net, interface));
         }
-        if !config.dns.is_empty() || !config.dns_search.is_empty() {
-            let servers = config.dns.iter().map(ToString::to_string).collect();
-            take_dns(owner, servers, config.dns_search.clone());
-            network.has_dns = true;
+        if !network.dns_after {
+            network.set_dns(true);
         }
         Ok(network)
+    }
+
+    fn set_dns(&mut self, on: bool) {
+        if on && !self.has_dns && (!self.dns.is_empty() || !self.dns_search.is_empty()) {
+            take_dns(self.owner, self.dns.clone(), self.dns_search.clone());
+            self.has_dns = true;
+        } else if !on && self.has_dns {
+            release_dns(self.owner);
+            self.has_dns = false;
+        }
+    }
+
+    // The routes and the DNS servers that wait for the login: on with it, off again when the session ends
+    pub fn after_login(&mut self, on: bool) {
+        if on == self.logged_in {
+            return;
+        }
+        self.logged_in = on;
+        let action = if on { Action::Add } else { Action::Delete };
+        for net in &self.after {
+            run_logged(ROUTE, &plan::route_args(action, net, &self.interface));
+        }
+        if self.dns_after {
+            self.set_dns(on);
+        }
     }
 
     fn gateway_for(&self, address: IpAddr) -> Option<&Gateway> {

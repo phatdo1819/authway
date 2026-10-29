@@ -1,5 +1,6 @@
 // The icon next to the clock, with the App of client/ behind it: what Windows shows of it (the icon, its balloons,
-// its menu, the login windows and the windows of details), and the messages of Windows that reach it
+// its menu, the main window, the login windows and the windows of details), and the messages of Windows that reach
+// it
 
 use std::cell::RefCell;
 use std::mem::{size_of, zeroed};
@@ -22,18 +23,23 @@ use windows_sys::Win32::UI::Shell::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, GetCursorPos, KillTimer, LoadImageW,
     PostMessageW, RegisterClassExW, RegisterWindowMessageW, SetForegroundWindow, SetMenuDefaultItem, SetTimer,
-    TrackPopupMenuEx, ENDSESSION_CLOSEAPP, HICON, HMENU, IMAGE_ICON, LR_DEFAULTCOLOR, MB_ICONERROR, MF_GRAYED,
-    MF_POPUP, MF_SEPARATOR, MF_STRING, SM_CXSMICON, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_CONTEXTMENU,
+    TrackPopupMenuEx, ENDSESSION_CLOSEAPP, HICON, HMENU, IMAGE_ICON, LR_DEFAULTCOLOR, MB_ICONERROR, MF_CHECKED,
+    MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, SM_CXSMICON, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+    WM_CONTEXTMENU,
     WM_ENDSESSION, WM_NULL, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPED,
 };
 
 use super::connect::ConnectWindow;
 use super::details::DetailsWindow;
-use super::{flows, instance, message_box, message_loop, Startup, WM_APP_EVENT, WM_APP_IMPORT, WM_APP_QUIT, WM_APP_SHOW, WM_APP_TRAY};
+use super::{
+    flows, home, instance, message_box, message_loop, Startup, WM_APP_EVENT, WM_APP_HOME, WM_APP_IMPORT, WM_APP_QUIT,
+    WM_APP_SHOW, WM_APP_TRAY,
+};
 use crate::client::details::Details;
 use crate::client::{self, Command, Icon, LoginForm, MenuItem, Shell, Waker};
 use crate::log;
 use crate::names::{self, PRODUCT, VERSION};
+use crate::settings;
 use crate::setup;
 use crate::win::{last_error, wide};
 
@@ -147,6 +153,19 @@ impl Shell for WinShell {
     fn import_later(&mut self) {
         unsafe { PostMessageW(self.hwnd, WM_APP_IMPORT, 0, 0) };
     }
+
+    fn has_main(&self) -> bool {
+        true
+    }
+
+    // at the sign-in only if the user didn't turn it off; out of the App, which the window asks for its overview
+    fn show_main(&mut self, startup: Startup) -> bool {
+        if startup == Startup::SignIn && !settings::open_at_sign_in() {
+            return false;
+        }
+        unsafe { PostMessageW(self.hwnd, WM_APP_HOME, 0, 0) };
+        true
+    }
 }
 
 thread_local! {
@@ -164,10 +183,16 @@ pub fn with_app<R>(action: impl FnOnce(&mut App) -> R) -> Option<R> {
 
 // the windows close, the icon goes
 pub fn shutdown() {
+    home::close();
     with_app(|app| {
         app.shutdown();
         app.shell.stop();
     });
+}
+
+// a text as the menu shows it: & marks the shortcut letter, && is one &
+fn menu_text(text: &str) -> Vec<u16> {
+    wide(&text.replace('&', "&&"))
 }
 
 // the items of the menu; each command at its place in the list, from 1
@@ -176,20 +201,39 @@ fn add_items(menu: HMENU, items: &[MenuItem], commands: &mut Vec<Command>, defau
         unsafe {
             match item {
                 MenuItem::Label(text) => {
-                    AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, wide(text).as_ptr());
+                    AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, menu_text(text).as_ptr());
                 }
                 MenuItem::Action { text, command, default: is_default } => {
                     commands.push(command.clone());
                     let id = commands.len() as u32;
-                    AppendMenuW(menu, MF_STRING, id as usize, wide(text).as_ptr());
+                    AppendMenuW(menu, MF_STRING, id as usize, menu_text(text).as_ptr());
                     if *is_default {
                         default.get_or_insert(id);
                     }
                 }
+                // the state at the right, where the shortcuts go
+                MenuItem::Switch { name, state, on, command } => {
+                    let text = if state.is_empty() { menu_text(name) } else { menu_text(&format!("{}\t{}", name, state)) };
+                    let mut flags = MF_STRING;
+                    if *on {
+                        flags |= MF_CHECKED;
+                    }
+                    let id = match command {
+                        Some(command) => {
+                            commands.push(command.clone());
+                            commands.len()
+                        }
+                        None => {
+                            flags |= MF_GRAYED;
+                            0
+                        }
+                    };
+                    AppendMenuW(menu, flags, id, text.as_ptr());
+                }
                 MenuItem::Submenu { text, items } => {
                     let submenu = CreatePopupMenu();
                     add_items(submenu, items, commands, default);
-                    AppendMenuW(menu, MF_POPUP, submenu as usize, wide(text).as_ptr());
+                    AppendMenuW(menu, MF_POPUP, submenu as usize, menu_text(text).as_ptr());
                 }
                 MenuItem::Separator => {
                     AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
@@ -201,6 +245,7 @@ fn add_items(menu: HMENU, items: &[MenuItem], commands: &mut Vec<Command>, defau
 
 fn run_command(hwnd: HWND, command: Command) {
     match command {
+        Command::Open => open_home(),
         Command::Connect(name) => {
             with_app(|app| app.connect(&name));
         }
@@ -257,6 +302,12 @@ fn show_menu(hwnd: HWND) {
     }
 }
 
+// the main window, then the login that waits, above it
+fn open_home() {
+    home::show();
+    with_app(|app| app.show_pending());
+}
+
 fn taskbar_created() -> u32 {
     static MESSAGE: OnceLock<u32> = OnceLock::new();
     *MESSAGE.get_or_init(|| unsafe { RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()) })
@@ -266,16 +317,15 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
     match message {
         WM_APP_EVENT => {
             with_app(|app| app.drain());
+            home::refresh();
         }
         WM_TIMER => {
             with_app(|app| app.tick());
+            home::refresh();
         }
+        WM_APP_HOME => open_home(),
         WM_APP_TRAY => match (lparam & 0xffff) as u32 {
-            NIN_SELECT | NIN_KEYSELECT => {
-                if !with_app(|app| app.show_pending()).unwrap_or(true) {
-                    show_menu(hwnd);
-                }
-            }
+            NIN_SELECT | NIN_KEYSELECT => open_home(),
             WM_CONTEXTMENU => show_menu(hwnd),
             NIN_BALLOONUSERCLICK => {
                 with_app(|app| app.balloon_clicked());

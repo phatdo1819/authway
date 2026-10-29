@@ -45,6 +45,48 @@ pub fn set_found_page(tunnel: &str, page: Option<&Page>) {
     }
 }
 
+fn user_dword(name: &str) -> Option<u32> {
+    Key::open(reg::HKEY_CURRENT_USER, &names::user_key())?.get_dword(name)
+}
+
+fn set_user_dword(name: &str, value: u32) {
+    if let Ok(key) = Key::create(reg::HKEY_CURRENT_USER, &names::user_key()) {
+        let _ = key.set_dword(name, value);
+    }
+}
+
+// The main window opens at the sign-in, as when the user starts the app, unless the user turned it off
+pub fn open_at_sign_in() -> bool {
+    user_dword("OpenAtSignIn") != Some(0)
+}
+
+pub fn set_open_at_sign_in(open: bool) {
+    set_user_dword("OpenAtSignIn", open as u32);
+}
+
+// the notice that the app keeps running when its window closes, the first time only
+pub fn close_notice_shown() -> bool {
+    user_dword("CloseNoticeShown") == Some(1)
+}
+
+pub fn set_close_notice_shown() {
+    set_user_dword("CloseNoticeShown", 1);
+}
+
+// where the user left the main window: left, top, width and height, in pixels of the screen
+pub fn window_place() -> Option<[i32; 4]> {
+    let text = Key::open(reg::HKEY_CURRENT_USER, &names::user_key())?.get_string("Window")?;
+    let numbers: Vec<i32> = text.split(',').filter_map(|part| part.trim().parse().ok()).collect();
+    numbers.try_into().ok()
+}
+
+pub fn set_window_place(place: [i32; 4]) {
+    if let Ok(key) = Key::create(reg::HKEY_CURRENT_USER, &names::user_key()) {
+        let text = place.iter().map(ToString::to_string).collect::<Vec<_>>().join(",");
+        let _ = key.set_string("Window", &text);
+    }
+}
+
 pub fn delete_user_settings() {
     let _ = reg::delete_tree(reg::HKEY_CURRENT_USER, &names::user_key());
 }

@@ -90,6 +90,17 @@ pub fn delete(name: &str) -> Result<(), String> {
     reg::delete_tree(root(), &path(name))
 }
 
+// with its GUID, so the device key and the network that Windows knows stay. The registry refuses a new case
+// alone: through a name that the list skips
+pub fn rename(name: &str, new_name: &str) -> Result<(), String> {
+    if name.eq_ignore_ascii_case(new_name) {
+        let between = format!(".{}", new_name);
+        reg::rename(root(), &path(name), &between)?;
+        return reg::rename(root(), &path(&between), new_name);
+    }
+    reg::rename(root(), &path(name), new_name)
+}
+
 fn blob(data: &[u8]) -> CRYPT_INTEGER_BLOB {
     CRYPT_INTEGER_BLOB { cbData: data.len() as u32, pbData: data.as_ptr() as *mut u8 }
 }
@@ -158,6 +169,14 @@ mod tests {
         let second = save(name, "other").unwrap();
         assert_eq!(guid_to_string(&first.id), guid_to_string(&second.id));
         assert!(list().iter().any(|stored| stored.name == name));
+        // renamed, with the same GUID; only the case too
+        rename(name, "store test 2").unwrap();
+        assert!(!exists(name));
+        assert_eq!(guid_to_string(&load("store test 2").unwrap().id), guid_to_string(&first.id));
+        rename("store test 2", name).unwrap();
+        rename(name, "Store Test").unwrap();
+        assert!(list().iter().any(|stored| stored.name == "Store Test"));
+        rename("Store Test", name).unwrap();
         delete(name).unwrap();
         assert!(!exists(name));
         assert!(load(name).is_err());

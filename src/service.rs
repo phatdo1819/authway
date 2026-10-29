@@ -47,7 +47,7 @@ use crate::conf::{self, Config};
 use crate::ipc::{self, Request, Response};
 use crate::log;
 #[cfg(not(feature = "testing"))]
-use crate::manager::{PeerStats, Tunnel};
+use crate::manager::{PeerStats, Steps, Tunnel};
 use crate::manager::{self, Client, Engine, Manager};
 use crate::names;
 use crate::settings;
@@ -65,6 +65,10 @@ struct DriverTunnel {
     adapter: crate::wg::Adapter,
     mtu: u32,
     interface: u32,
+    // what waits for the login: the routes, and the DNS servers when they do
+    after: Vec<conf::IpNet>,
+    dns: Vec<std::net::IpAddr>,
+    dns_search: Vec<String>,
 }
 
 #[cfg(not(feature = "testing"))]
@@ -84,6 +88,10 @@ impl Tunnel for DriverTunnel {
     fn set_endpoint(&mut self, public_key: &conf::Key, address: SocketAddr) -> Result<(), String> {
         self.adapter.set_endpoint(public_key, &address)
     }
+
+    fn after_login(&mut self, on: bool) -> Result<(), String> {
+        crate::net::after_login(self.adapter.luid(), &self.after, &self.dns, &self.dns_search, on)
+    }
 }
 
 // WireGuardNT, loaded at the first tunnel turned on
@@ -101,6 +109,7 @@ impl Engine for DriverEngine {
         guid: &GUID,
         config: &Config,
         endpoints: &[Option<SocketAddr>],
+        steps: &Steps,
     ) -> Result<Box<dyn Tunnel>, String> {
         use crate::{net, wg};
         if self.wireguard.is_none() {
@@ -112,7 +121,7 @@ impl Engine for DriverEngine {
             Some(mtu) => mtu as u32,
             None => endpoints.iter().flatten().next().map(net::auto_mtu).unwrap_or(net::DEFAULT_MTU),
         };
-        net::configure(adapter.luid(), config, mtu)?;
+        net::configure(adapter.luid(), config, &steps.before, !steps.dns_after, mtu)?;
         let interface = net::interface_index(adapter.luid())?;
         adapter.set_config(config, endpoints)?;
         adapter.set_up(true)?;
@@ -124,7 +133,9 @@ impl Engine for DriverEngine {
             mtu,
             wireguard.driver_version().unwrap_or_else(|| "?".to_string())
         );
-        Ok(Box::new(DriverTunnel { adapter, mtu, interface }))
+        let (dns, dns_search) =
+            if steps.dns_after { (config.dns.clone(), config.dns_search.clone()) } else { (Vec::new(), Vec::new()) };
+        Ok(Box::new(DriverTunnel { adapter, mtu, interface, after: steps.after.clone(), dns, dns_search }))
     }
 }
 
