@@ -23,9 +23,10 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::HiDpi::SystemParametersInfoForDpi;
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DispatchMessageW, GetAncestor, GetMessageW, GetWindowTextLengthW, GetWindowTextW, IsDialogMessageW,
-    MessageBoxW, MoveWindow, SendMessageW, SetWindowTextW, TranslateMessage, GA_ROOT, HMENU, MESSAGEBOX_RESULT,
-    MESSAGEBOX_STYLE, MSG, NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SW_SHOWNORMAL, WM_APP, WM_SETFONT, WS_CHILD,
+    BeginDeferWindowPos, CreateWindowExW, DeferWindowPos, DispatchMessageW, EndDeferWindowPos, GetAncestor, GetMessageW,
+    GetWindowTextLengthW, GetWindowTextW, IsDialogMessageW, MessageBoxW, MoveWindow, SendMessageW, SetWindowPos,
+    SetWindowTextW, TranslateMessage, GA_ROOT, HMENU, MESSAGEBOX_RESULT, MESSAGEBOX_STYLE, MSG, NONCLIENTMETRICSW,
+    SPI_GETNONCLIENTMETRICS, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOZORDER, SW_SHOWNORMAL, WM_APP, WM_SETFONT, WS_CHILD,
     WS_VISIBLE,
 };
 
@@ -115,6 +116,27 @@ pub fn child(parent: HWND, class: &str, text: &str, style: u32, ex_style: u32, i
 
 pub fn place(window: HWND, x: i32, y: i32, width: i32, height: i32) {
     unsafe { MoveWindow(window, x, y, width, height, 1) };
+}
+
+// A place for each control, all of them in one go and without the pixels of their old places, for the window to
+// paint again afterwards: moved one by one, while they cross each other, they leave pieces of their old frames behind
+pub fn place_all(places: &[(HWND, i32, i32, i32, i32)]) {
+    let flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS;
+    unsafe {
+        let mut defer = BeginDeferWindowPos(places.len() as i32);
+        for &(window, x, y, width, height) in places {
+            if defer.is_null() {
+                break;
+            }
+            defer = DeferWindowPos(defer, window, ptr::null_mut(), x, y, width, height, flags);
+        }
+        // Windows didn't take them: one by one
+        if defer.is_null() || EndDeferWindowPos(defer) == 0 {
+            for &(window, x, y, width, height) in places {
+                SetWindowPos(window, ptr::null_mut(), x, y, width, height, flags);
+            }
+        }
+    }
 }
 
 pub fn set_font(window: HWND, font: HFONT) {

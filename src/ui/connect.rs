@@ -7,8 +7,9 @@ use std::sync::Once;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, GetSysColor, GetSysColorBrush, MonitorFromPoint, SetBkColor, SetTextColor, COLOR_WINDOW,
-    COLOR_WINDOWTEXT, HDC, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    GetMonitorInfoW, GetSysColor, GetSysColorBrush, MonitorFromPoint, RedrawWindow, SetBkColor, SetTextColor,
+    COLOR_WINDOW, COLOR_WINDOWTEXT, HDC, MONITORINFO, MONITOR_DEFAULTTONEAREST, RDW_ALLCHILDREN, RDW_ERASE, RDW_FRAME,
+    RDW_INVALIDATE,
 };
 use windows_sys::Win32::System::SystemServices::SS_NOPREFIX;
 use windows_sys::Win32::UI::Controls::{BST_CHECKED, BST_UNCHECKED, EM_SETCUEBANNER, EM_SETLIMITTEXT, EM_SETSEL};
@@ -20,13 +21,14 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     BN_CLICKED, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, DC_HASDEFID, DM_GETDEFID,
     EN_CHANGE, ES_AUTOHSCROLL, ES_NUMBER, ES_PASSWORD, HWND_NOTOPMOST, HWND_TOPMOST, IDCANCEL, IDOK, IMAGE_ICON,
     LR_DEFAULTCOLOR, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_RESTORE, SW_SHOW, WM_CLOSE,
-    WM_COMMAND, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DPICHANGED, WNDCLASSEXW, WS_CAPTION, WS_EX_APPWINDOW,
-    WS_EX_CLIENTEDGE, WS_EX_CONTROLPARENT, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP,
+    WM_COMMAND, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DPICHANGED, WNDCLASSEXW, WS_CAPTION, WS_CLIPCHILDREN,
+    WS_EX_APPWINDOW, WS_EX_CLIENTEDGE, WS_EX_CONTROLPARENT, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP,
 };
 
 use super::tray::with_app;
 use super::{
-    add_dialog, child, get_text, instance, line_height, measure, place, remove_dialog, scale, set_font, set_text, Fonts,
+    add_dialog, child, get_text, instance, line_height, measure, place_all, remove_dialog, scale, set_font, set_text,
+    Fonts,
 };
 use crate::client::{LoginValues, LoginView, OTP_LENGTH};
 use crate::creds::SavedLogin;
@@ -36,7 +38,8 @@ use crate::strings;
 use crate::win::wide;
 
 const CLASS: &str = "AuthwayConnect";
-const STYLE: u32 = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+// it never paints over its fields, which move when the texts above them change
+const STYLE: u32 = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
 const EX_STYLE: u32 = WS_EX_APPWINDOW | WS_EX_CONTROLPARENT;
 
 const ID_HEADING: i32 = 100;
@@ -222,9 +225,12 @@ impl ConnectWindow {
         set_font(self.code, self.fonts.large);
     }
 
-    // The sizes follow the font, which follows the scale of the display
+    // The sizes follow the font, which follows the scale of the display. The fields move all at once, then the window
+    // paints again with them: the heading, the hint, the notice and the error change their places
     fn layout(&self) {
         let hwnd = self.hwnd;
+        let mut places = Vec::new();
+        let mut place = |window: HWND, x: i32, y: i32, width: i32, height: i32| places.push((window, x, y, width, height));
         let s = |value: i32| scale(value, self.dpi);
         let normal = self.fonts.normal;
         let margin = s(22);
@@ -289,6 +295,7 @@ impl ConnectWindow {
         place(self.cancel, cancel_x, y, button_width, button_height);
         place(self.ok, cancel_x - s(8) - button_width, y, button_width, button_height);
         y += button_height + margin;
+        place_all(&places);
 
         let mut rect = RECT { left: 0, top: 0, right: margin * 2 + width, bottom: y };
         unsafe {
@@ -302,6 +309,7 @@ impl ConnectWindow {
                 rect.bottom - rect.top,
                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
             );
+            RedrawWindow(hwnd, ptr::null(), ptr::null_mut(), RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN);
         }
     }
 
