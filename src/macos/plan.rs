@@ -126,6 +126,45 @@ pub fn parse_route_interface(text: &str) -> Option<String> {
     text.lines().find_map(|line| line.trim().strip_prefix("interface:").map(|name| name.trim().to_string()))
 }
 
+// The way to an address, as route -n get says it
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Way {
+    // through a router, or the point-to-point link of the default route
+    Gateway(Gateway),
+    // on a network of the computer, its interface: route writes no router then, a link#12 or a hardware address
+    Local(String),
+}
+
+impl Way {
+    fn interface(&self) -> &str {
+        match self {
+            Way::Gateway(gateway) => &gateway.interface,
+            Way::Local(interface) => interface,
+        }
+    }
+}
+
+pub fn parse_route_way(text: &str) -> Option<Way> {
+    let value = |key: &str| text.lines().find_map(|line| line.trim().strip_prefix(key).map(|value| value.trim().to_string()));
+    let interface = value("interface:")?;
+    let router = value("gateway:").filter(|gateway| gateway.split('%').next().is_some_and(|ip| ip.parse::<IpAddr>().is_ok()));
+    Some(match router {
+        Some(router) => Way::Gateway(Gateway { address: Some(router), interface }),
+        None if value("destination:").as_deref() == Some("default") => Way::Gateway(Gateway { address: None, interface }),
+        None => Way::Local(interface),
+    })
+}
+
+// The way to a server out of the tunnel: the one macOS has for its address, so that a server on a network of the
+// computer (a virtual machine of this Mac, a firewall of the office) stays on that network and isn't sent to the
+// router; the default route of the network when that way goes into a tunnel
+pub fn server_way(route: Option<Way>, default: Option<&Gateway>) -> Option<Way> {
+    match route {
+        Some(way) if !way.interface().starts_with("utun") && !way.interface().starts_with("lo") => Some(way),
+        _ => default.cloned().map(Way::Gateway),
+    }
+}
+
 // "en0: flags=8863<UP,...> mtu 1500" in ifconfig en0
 pub fn parse_mtu(ifconfig: &str) -> Option<u32> {
     let first = ifconfig.lines().next()?;
@@ -198,6 +237,40 @@ mod tests {
         );
         let link = Gateway { address: None, interface: "en5".into() };
         assert_eq!(host_route_args(Action::Delete, "203.0.113.1".parse().unwrap(), &link)[5..], ["-interface", "en5"]);
+    }
+
+    #[test]
+    fn the_way_to_a_server() {
+        let router = Gateway { address: Some("192.168.1.1".into()), interface: "en0".into() };
+        // on the internet: through the router
+        let internet = "   route to: 203.0.113.10\ndestination: default\n       mask: default\n    gateway: 192.168.1.1\n  \
+                        interface: en0\n      flags: <UP,GATEWAY,DONE,STATIC,PRCLONING,GLOBAL>\n";
+        assert_eq!(parse_route_way(internet), Some(Way::Gateway(router.clone())));
+        // a firewall on the network of the computer, its hardware address known (from a Mac): no router
+        let known = "   route to: 192.168.100.108\ndestination: 192.168.100.108\n  interface: en0\n      \
+                     flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>\n";
+        assert_eq!(parse_route_way(known), Some(Way::Local("en0".into())));
+        let mac = "   route to: 192.168.100.108\ndestination: 192.168.100.108\n    gateway: 52:95:b4:11:ad:cf\n  \
+                   interface: en0\n";
+        assert_eq!(parse_route_way(mac), Some(Way::Local("en0".into())));
+        let network = "   route to: 192.168.64.3\ndestination: 192.168.64.0\n       mask: 255.255.255.0\n  \
+                       interface: bridge100\n      flags: <UP,DONE,CLONING>\n";
+        assert_eq!(parse_route_way(network), Some(Way::Local("bridge100".into())));
+        // the default route on a point-to-point link: through its interface
+        let ppp = "   route to: 203.0.113.10\ndestination: default\n       mask: default\n  interface: ppp0\n";
+        assert_eq!(parse_route_way(ppp), Some(Way::Gateway(Gateway { address: None, interface: "ppp0".into() })));
+        assert_eq!(parse_route_way("route: writing to routing socket: not in table\n"), None);
+        let v6 = "   route to: 2001:db8::10\ndestination: default\n    gateway: fe80::1%en0\n  interface: en0\n";
+        assert_eq!(
+            parse_route_way(v6),
+            Some(Way::Gateway(Gateway { address: Some("fe80::1%en0".into()), interface: "en0".into() }))
+        );
+
+        assert_eq!(server_way(Some(Way::Local("en0".into())), Some(&router)), Some(Way::Local("en0".into())));
+        // a way into a tunnel, this one or another VPN: the router of the network
+        assert_eq!(server_way(Some(Way::Local("utun4".into())), Some(&router)), Some(Way::Gateway(router.clone())));
+        assert_eq!(server_way(None, Some(&router)), Some(Way::Gateway(router.clone())));
+        assert_eq!(server_way(None, None), None);
     }
 
     #[test]

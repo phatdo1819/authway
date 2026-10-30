@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::conf::{Config, IpNet};
 use crate::log;
 use crate::manager::Steps;
-use crate::plan::{self, Action, Gateway};
+use crate::plan::{self, Action, Gateway, Way};
 use crate::setup;
 
 // the MTU of WireGuard on an Ethernet of 1500
@@ -77,6 +77,13 @@ fn gateways() -> (Option<Gateway>, Option<Gateway>) {
             .and_then(|text| plan::parse_default_route(&text, ipv6))
     };
     (read("inet", false), read("inet6", true))
+}
+
+// the way that the routes choose for the address
+fn route_way(address: IpAddr) -> Option<Way> {
+    let family = if address.is_ipv4() { "-inet" } else { "-inet6" };
+    let args = ["-n", "get", family, &address.to_string()].map(str::to_string);
+    run(ROUTE, &args).ok().and_then(|text| plan::parse_route_way(&text))
 }
 
 // the name of the network interface that the routes choose for the address
@@ -297,12 +304,10 @@ impl Network {
         }
     }
 
-    fn gateway_for(&self, address: IpAddr) -> Option<&Gateway> {
-        if address.is_ipv4() {
-            self.gateways.0.as_ref()
-        } else {
-            self.gateways.1.as_ref()
-        }
+    // the way of macOS to the address, unless it goes into a tunnel: then the default route of the network
+    fn way_to(&self, address: IpAddr) -> Option<Way> {
+        let default = if address.is_ipv4() { self.gateways.0.as_ref() } else { self.gateways.1.as_ref() };
+        plan::server_way(route_way(address), default)
     }
 
     // a server, at its first address or at a fallback: out of the tunnel when the tunnel would carry it
@@ -315,9 +320,18 @@ impl Network {
     }
 
     fn add_host_route(&mut self, address: IpAddr) {
-        let Some(gateway) = self.gateway_for(address).cloned() else {
-            log!("{}: no route out of the tunnel to {}", self.interface, address);
-            return;
+        let gateway = match self.way_to(address) {
+            Some(Way::Gateway(gateway)) => gateway,
+            // the route of that network keeps it out of the tunnel, which gets halves of the default route and other
+            // networks; a route of the address alone to the interface would take the hardware address of the Mac
+            Some(Way::Local(interface)) => {
+                log!("{}: {} is on the network of {}", self.interface, address, interface);
+                return;
+            }
+            None => {
+                log!("{}: no route out of the tunnel to {}", self.interface, address);
+                return;
+            }
         };
         // one of before, from a tunnel that went off without taking it back
         let _ = run(ROUTE, &plan::host_route_args(Action::Delete, address, &gateway));
