@@ -14,6 +14,13 @@ WireGuard server, without a login.
 > macOS version has never run on a Mac. A VPN client handles your traffic and your passwords: read the code before
 > you trust it, don't use it in production, and use it at your own risk.
 
+| The VPNs | The page of a VPN | The login |
+| --- | --- | --- |
+| <img src="docs/screenshots/main-window.png" alt="The main window: three VPNs, one waiting for the login with its Log in button, two connected with their speeds" width="280"> | <img src="docs/screenshots/vpn-page.png" alt="The page of a VPN: connected as alice, the traffic graph, the speeds, the bytes, the address and the routing" width="280"> | <img src="docs/screenshots/login-window.png" alt="The login window: username, password and the code of the authenticator app" width="280"> |
+
+Authway on Windows, with made-up names and documentation addresses. There's no picture of the macOS version: it
+hasn't run on a Mac yet.
+
 To set up the firewall side and test both together, follow
 [WGAUTH-TESTING.md](https://github.com/phatdo1819/nethsecurity/blob/ci-wgauth/WGAUTH-TESTING.md) on the
 `ci-wgauth` branch of the NethSecurity fork: steps 1–7 for the login, step 8 for the fallback addresses, step 9
