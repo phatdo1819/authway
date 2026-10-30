@@ -8,9 +8,11 @@ with the WireGuard servers of a NethSecurity firewall that use the login of
 WireGuard server, without a login.
 
 > [!WARNING]
-> **This project was written by an AI** (Claude, by Anthropic), directed and tested by one person. No security
-> expert has reviewed it, and it hasn't been tested against a real NethSecurity server yet. A VPN client handles
-> your traffic and your passwords: read the code before you trust it, and use it at your own risk.
+> **Authway is a proof of concept**, not a finished product: it was made to try the login of ns-wgauth from a
+> client that logs in by itself. **It was written by an AI** (Claude, by Anthropic), directed and tested by one
+> person. No security expert has reviewed it, it hasn't been tested against a real NethSecurity server yet, and the
+> macOS version has never run on a Mac. A VPN client handles your traffic and your passwords: read the code before
+> you trust it, don't use it in production, and use it at your own risk.
 
 To set up the firewall side and test both together, follow
 [WGAUTH-TESTING.md](https://github.com/phatdo1819/nethsecurity/blob/ci-wgauth/WGAUTH-TESTING.md) on the
