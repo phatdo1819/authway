@@ -1,10 +1,13 @@
-// The app in the menu bar, with AppKit: the state lives in one App (client/) on the main thread, reached through
-// with_app(). The modal steps (alerts, the file panel, the password of an administrator) run outside of it, in
-// flows.rs, so that the events that they let through find the App free; the same as on Windows.
+// The app in the menu bar and its main window, with AppKit: the state lives in one App (client/) on the main
+// thread, reached through with_app(). The modal steps (alerts, the file panel, the password of an administrator)
+// run outside of it, in flows.rs, so that the events that they let through find the App free; the same as on
+// Windows.
 
 pub mod details;
 pub mod flows;
+pub mod home;
 pub mod login;
+mod views;
 
 use std::cell::{Cell, RefCell};
 use std::fs::{self, File, OpenOptions};
@@ -17,9 +20,9 @@ use objc2::runtime::{AnyObject, ProtocolObject, Sel};
 use objc2::{define_class, msg_send, sel, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSAlert, NSAlertStyle, NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
-    NSApplicationTerminateReply, NSControlStateValueOn, NSControlTextEditingDelegate, NSImage, NSMenu, NSMenuDelegate,
-    NSMenuItem,
-    NSStatusBar, NSStatusItem, NSTextFieldDelegate, NSVariableStatusItemLength, NSView, NSWindow, NSWindowDelegate,
+    NSApplicationTerminateReply, NSControlStateValueOn, NSControlTextEditingDelegate, NSEventModifierFlags, NSImage,
+    NSMenu, NSMenuDelegate, NSMenuItem, NSStatusBar, NSStatusItem, NSTextFieldDelegate, NSVariableStatusItemLength,
+    NSView, NSWindow, NSWindowDelegate,
 };
 use objc2_foundation::{
     ns_string, NSActivityOptions, NSDistributedNotificationCenter, NSNotification, NSObject, NSObjectProtocol,
@@ -30,6 +33,7 @@ use crate::client::details::Details;
 use crate::client::{self, Command, Icon, LoginForm, MenuItem, Shell, Waker};
 use crate::log;
 use crate::names::{self, PRODUCT, VERSION};
+use crate::settings;
 use crate::setup;
 
 pub use crate::client::Startup;
@@ -134,6 +138,34 @@ define_class!(
         #[unsafe(method(tick:))]
         fn tick(&self, _timer: &NSTimer) {
             with_app(|app| app.tick());
+            home::refresh();
+        }
+
+        // a button, a switch or Return in a field of the main window
+        #[unsafe(method(homePressed:))]
+        fn home_pressed(&self, sender: &NSView) {
+            match home::action_of(sender) {
+                Some(action) => later(move || home::run(action)),
+                // a switch that can't turn now: back as it was
+                None => later(home::refresh),
+            }
+        }
+
+        // the menu "More" of the main window
+        #[unsafe(method(homeMenu:))]
+        fn home_menu(&self, item: &NSMenuItem) {
+            let tag = item.tag();
+            later(move || home::menu_chosen(tag));
+        }
+
+        // Cmd+Q, while the app is in the Dock
+        #[unsafe(method(quitChosen:))]
+        fn quit_chosen(&self, _item: &NSMenuItem) {
+            later(|| {
+                if let Some(mtm) = MainThreadMarker::new() {
+                    flows::quit(mtm, true);
+                }
+            });
         }
 
         #[unsafe(method(connectPressed:))]
@@ -209,30 +241,46 @@ define_class!(
     }
 
     unsafe impl NSWindowDelegate for Target {
-        // the close button: the App closes the window, as with Cancel
+        // the close button: the App closes the window, as with Cancel; the main window hides
         #[unsafe(method(windowShouldClose:))]
         fn window_should_close(&self, sender: &NSWindow) -> bool {
             let id = window_id(sender);
-            later(move || {
-                with_app(|app| {
-                    if app.login_of(id).is_some() {
-                        app.cancel(id);
-                    } else {
-                        app.close_details(id);
-                    }
+            if home::is_home(id) {
+                later(home::hide);
+            } else {
+                later(move || {
+                    with_app(|app| {
+                        if app.login_of(id).is_some() {
+                            app.cancel(id);
+                        } else {
+                            app.close_details(id);
+                        }
+                    });
                 });
-            });
+            }
             false
+        }
+
+        #[unsafe(method(windowDidResize:))]
+        fn window_did_resize(&self, notification: &NSNotification) {
+            let window = notification.object().and_then(|object| object.downcast::<NSWindow>().ok());
+            if let Some(id) = window.map(|window| window_id(&window)) {
+                home::resized(id);
+            }
         }
     }
 
     unsafe impl NSControlTextEditingDelegate for Target {
-        // the field of the code: a pasted code, the sixth digit
+        // the field of the code: a pasted code, the sixth digit; the fields of the main window
         #[unsafe(method(controlTextDidChange:))]
         fn control_text_did_change(&self, notification: &NSNotification) {
             let window = notification.object().and_then(|object| object.downcast::<NSView>().ok()).and_then(|view| view.window());
             if let Some(id) = window.map(|window| window_id(&window)) {
-                with_app(|app| app.code_changed(id));
+                if home::is_home(id) {
+                    home::text_changed();
+                } else {
+                    with_app(|app| app.code_changed(id));
+                }
             }
         }
     }
@@ -303,8 +351,7 @@ pub fn menu_item(mtm: MainThreadMarker, title: &str, action: Option<Sel>) -> Ret
 fn run_command(command: Command) {
     let Some(mtm) = MainThreadMarker::new() else { return };
     match command {
-        // the menu bar is all there is on macOS
-        Command::Open => {}
+        Command::Open => open_home(),
         Command::Connect(name) => {
             with_app(|app| app.connect(&name));
         }
@@ -337,11 +384,23 @@ fn run_command(command: Command) {
     }
 }
 
-// The menus of the app, for the keys of the windows: without them, Cmd+V doesn't paste a code
-fn main_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {
+// the main window, then the login that waits, above it
+fn open_home() {
+    home::show();
+    with_app(|app| app.show_pending());
+}
+
+// The menus of the app, for the keys of the windows: without them, Cmd+V doesn't paste a code. They show while the
+// main window puts the app in the Dock.
+fn main_menu(target: &Target) -> Retained<NSMenu> {
+    let mtm = target.mtm();
     let item = |title: &str, action: Sel, key: &str| unsafe {
         NSMenuItem::initWithTitle_action_keyEquivalent(NSMenuItem::alloc(mtm), &ns(title), Some(action), &ns(key))
     };
+    let hide_others = item("Hide Others", sel!(hideOtherApplications:), "h");
+    hide_others.setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Option);
+    let quit = item(&format!("Quit {}", PRODUCT), sel!(quitChosen:), "q");
+    unsafe { quit.setTarget(Some(target.object())) };
     let submenu = |title: &str, items: Vec<Retained<NSMenuItem>>| {
         let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), &ns(title));
         for entry in items {
@@ -352,7 +411,16 @@ fn main_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {
         entry
     };
     let main = NSMenu::new(mtm);
-    main.addItem(&submenu(PRODUCT, vec![]));
+    main.addItem(&submenu(
+        PRODUCT,
+        vec![
+            item(&format!("Hide {}", PRODUCT), sel!(hide:), "h"),
+            hide_others,
+            item("Show All", sel!(unhideAllApplications:), ""),
+            NSMenuItem::separatorItem(mtm),
+            quit,
+        ],
+    ));
     main.addItem(&submenu(
         "Edit",
         vec![
@@ -365,7 +433,10 @@ fn main_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {
             item("Select All", sel!(selectAll:), "a"),
         ],
     ));
-    main.addItem(&submenu("Window", vec![item("Close", sel!(performClose:), "w")]));
+    main.addItem(&submenu(
+        "Window",
+        vec![item("Minimize", sel!(performMiniaturize:), "m"), item("Close", sel!(performClose:), "w")],
+    ));
     main
 }
 
@@ -393,6 +464,7 @@ impl Shell for MacShell {
         Arc::new(|| {
             later(|| {
                 with_app(|app| app.drain());
+                home::refresh();
             })
         })
     }
@@ -428,11 +500,25 @@ impl Shell for MacShell {
             }
         });
     }
+
+    fn has_main(&self) -> bool {
+        true
+    }
+
+    // at the sign-in only if the user didn't turn it off; out of the App, which the window asks for its overview
+    fn show_main(&mut self, startup: Startup) -> bool {
+        if startup == Startup::SignIn && !settings::open_at_sign_in() {
+            return false;
+        }
+        later(open_home);
+        true
+    }
 }
 
 // the windows close, the icon goes; the tunnels are off
 pub fn shutdown() {
     QUITTING.set(true);
+    home::close();
     with_app(|app| {
         app.shutdown();
         NSStatusBar::systemStatusBar().removeStatusItem(&app.shell.status);
@@ -470,7 +556,7 @@ pub fn run(startup: Startup) -> i32 {
     application.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
     let target = Target::new(mtm);
     application.setDelegate(Some(ProtocolObject::from_ref(&*target)));
-    application.setMainMenu(Some(&main_menu(mtm)));
+    application.setMainMenu(Some(&main_menu(&target)));
     let status = NSStatusBar::systemStatusBar().statusItemWithLength(NSVariableStatusItemLength);
     let menu = NSMenu::new(mtm);
     menu.setAutoenablesItems(false);

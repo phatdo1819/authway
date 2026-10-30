@@ -86,6 +86,11 @@ struct UserSettings {
     // the items of the keychain, to remove them with the app
     #[serde(default)]
     credentials: Vec<String>,
+    // the main window opens at the sign-in, unless the user turned it off
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    open_at_sign_in: Option<bool>,
+    #[serde(default)]
+    close_notice_shown: bool,
 }
 
 fn user_file() -> PathBuf {
@@ -144,6 +149,28 @@ pub fn remove_credential(service: &str) {
     if settings.credentials.len() != before {
         store(&settings);
     }
+}
+
+// The main window opens at the sign-in, as when the user starts the app, unless the user turned it off
+pub fn open_at_sign_in() -> bool {
+    load().open_at_sign_in != Some(false)
+}
+
+pub fn set_open_at_sign_in(open: bool) {
+    let mut settings = load();
+    settings.open_at_sign_in = Some(open);
+    store(&settings);
+}
+
+// the notice that the app keeps running when its window closes, the first time only
+pub fn close_notice_shown() -> bool {
+    load().close_notice_shown
+}
+
+pub fn set_close_notice_shown() {
+    let mut settings = load();
+    settings.close_notice_shown = true;
+    store(&settings);
 }
 
 pub fn delete_user_settings() {

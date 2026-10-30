@@ -8,7 +8,7 @@
 // lives apart from the App, in HOME: the App is busy while its calls open windows, and the window paints meanwhile.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::mem::{replace, size_of, zeroed};
 use std::ptr;
 use std::sync::Once;
@@ -53,7 +53,7 @@ use super::tray::with_app;
 use super::{add_dialog, child, get_text, instance, message_box, open_in_notepad, remove_dialog, scale, set_font, set_text};
 use crate::api::Page as LoginPage;
 use crate::client::details::handshake_text;
-use crate::client::overview::{Card, Overview, Tone, Traffic};
+use crate::client::overview::{Card, History, Overview, Tone, Traffic, SAMPLES};
 use crate::client::{ServiceState, Shell};
 use crate::conf::MAX_NAME_LENGTH;
 use crate::creds;
@@ -89,10 +89,6 @@ const BUTTON_HEIGHT: i32 = 32;
 const FIELD_HEIGHT: i32 = 34;
 const GRAPH_HEIGHT: i32 = 76;
 const SCROLL_LINE: i32 = 48;
-// the points of the graph: one each time the service gives new counters, every 2 or 3 seconds
-const SAMPLES: usize = 60;
-// seconds without new counters: no traffic
-const IDLE: f64 = 6.0;
 
 // a paint that found the window busy, done again
 const WM_APP_REDRAW: u32 = WM_APP + 20;
@@ -204,44 +200,6 @@ enum Shape {
     Graph(RECT),
     // the frame of a text field
     Field(RECT, HWND),
-}
-
-// the traffic of a VPN, sampled each time its counters change
-#[derive(Default)]
-struct History {
-    last: Option<(Instant, u64, u64)>,
-    // bytes per second received and sent
-    rates: VecDeque<(f64, f64)>,
-}
-
-impl History {
-    fn add(&mut self, now: Instant, rx: u64, tx: u64) {
-        match self.last {
-            // a new connection starts from 0
-            Some((_, last_rx, last_tx)) if rx < last_rx || tx < last_tx => {
-                self.rates.clear();
-                self.last = Some((now, rx, tx));
-            }
-            Some((at, last_rx, last_tx)) => {
-                // the counters come with the lists of the service, every 2 or 3 seconds: the window asks more often.
-                // Nothing new for longer, nothing passed
-                let seconds = now.duration_since(at).as_secs_f64();
-                if rx == last_rx && tx == last_tx && seconds < IDLE {
-                    return;
-                }
-                self.rates.push_back(((rx - last_rx) as f64 / seconds, (tx - last_tx) as f64 / seconds));
-                while self.rates.len() > SAMPLES {
-                    self.rates.pop_front();
-                }
-                self.last = Some((now, rx, tx));
-            }
-            None => self.last = Some((now, rx, tx)),
-        }
-    }
-
-    fn now(&self) -> (f64, f64) {
-        self.rates.back().copied().unwrap_or((0.0, 0.0))
-    }
 }
 
 // the page of a VPN: its fields stay while the overview changes under them
@@ -983,7 +941,7 @@ impl Home {
         let state_color = self.state_color(card.tone);
         shapes.push(self.text_shape(rect(inner_left + dot * 2 + s(10), y, switch_left - s(12), y + name_line), Font::Name, state_color, card.state.clone(), ellipsis));
         y += name_line + s(4);
-        let sub = [card.host.as_str(), card.server.as_str()].iter().filter(|text| !text.is_empty()).copied().collect::<Vec<_>>().join("  ·  ");
+        let sub = card.subtitle();
         if !sub.is_empty() {
             shapes.push(self.text_shape(rect(inner_left, y, switch_left - s(12), y + small_line), Font::Small, palette.muted, sub, ellipsis));
             y += small_line;
@@ -1464,18 +1422,8 @@ impl Home {
     }
 
     fn graph_top(&self) -> f64 {
-        let Some(View::Vpn(name)) = Some(&self.view) else { return 1024.0 };
-        let highest = self
-            .history
-            .get(name)
-            .map(|history| history.rates.iter().fold(0.0f64, |top, (rx, tx)| top.max(*rx).max(*tx)))
-            .unwrap_or(0.0);
-        // a round number above, at least 1 KB/s
-        let mut top = 1024.0;
-        while top < highest * 1.1 {
-            top *= 2.0;
-        }
-        top
+        let View::Vpn(name) = &self.view else { return 1024.0 };
+        self.history.get(name).map_or(1024.0, History::top)
     }
 
     // received in the accent, filled under; sent in teal; the newest on the right
@@ -1683,8 +1631,7 @@ impl Home {
         let text_right = shape.text_right;
         let line = |font: Font| theme::measure(dc, &self.fonts, font, "Xy", None).1;
         theme::text(dc, &self.fonts, Font::Name, palette.text, &card.name, &rect(pad, shape.name_top, text_right, shape.name_top + line(Font::Name)), ellipsis);
-        let sub = [card.host.as_str(), card.server.as_str()].iter().filter(|text| !text.is_empty()).copied().collect::<Vec<_>>().join("  ·  ");
-        theme::text(dc, &self.fonts, Font::Small, palette.muted, &sub, &rect(pad, shape.sub_top, text_right, shape.sub_top + line(Font::Small)), ellipsis);
+        theme::text(dc, &self.fonts, Font::Small, palette.muted, &card.subtitle(), &rect(pad, shape.sub_top, text_right, shape.sub_top + line(Font::Small)), ellipsis);
         let state = rect(pad + s(16), shape.state_top, text_right, shape.state_top + line(Font::Body));
         theme::text(dc, &self.fonts, Font::Body, self.state_color(card.tone), &card.state, &state, ellipsis);
         if let (Some(top), Some(traffic)) = (shape.traffic_top, &card.traffic) {
@@ -2135,37 +2082,4 @@ unsafe extern "system" fn button_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
         _ => {}
     }
     DefSubclassProc(hwnd, message, wparam, lparam)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::Duration;
-
-    #[test]
-    fn speeds_from_the_counters() {
-        let start = Instant::now();
-        let at = |seconds: f64| start + Duration::from_secs_f64(seconds);
-        let mut history = History::default();
-        history.add(at(0.0), 0, 0);
-        // the window asks between two lists of the service: nothing new yet
-        history.add(at(1.0), 0, 0);
-        assert!(history.rates.is_empty());
-        history.add(at(2.0), 2048, 1024);
-        assert_eq!(history.now(), (1024.0, 512.0));
-        // the same counters a second later, then new ones over 2.5 seconds
-        history.add(at(3.0), 2048, 1024);
-        history.add(at(4.5), 2048 + 2560, 1024);
-        assert_eq!((history.rates.len(), history.now()), (2, (1024.0, 0.0)));
-        // nothing new for longer: nothing passes
-        history.add(at(11.0), 2048 + 2560, 1024);
-        assert_eq!(history.now(), (0.0, 0.0));
-        // a new connection starts again
-        history.add(at(12.0), 10, 10);
-        assert!(history.rates.is_empty());
-        for second in 0..SAMPLES + 10 {
-            history.add(at(13.0 + second as f64 * 2.0), 10 + 100 * second as u64, 10);
-        }
-        assert_eq!(history.rates.len(), SAMPLES);
-    }
 }

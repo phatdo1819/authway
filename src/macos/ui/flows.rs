@@ -217,6 +217,41 @@ pub fn remove(mtm: MainThreadMarker, name: &str) {
     with_app(|app| app.removed(name));
 }
 
+// While the VPN is off; macOS asks for an administrator when the user isn't allowed. True when it's done
+pub fn rename(mtm: MainThreadMarker, name: &str, new_name: &str) -> bool {
+    match ipc::call(&Request::Rename { name: name.to_string(), new_name: new_name.to_string() }) {
+        Ok(response) if response.ok => {}
+        Ok(response) if response.error_code() == ipc::ACCESS_DENIED => {
+            let exe = match std::env::current_exe() {
+                Ok(exe) => exe,
+                Err(error) => {
+                    error_alert(mtm, &error.to_string());
+                    return false;
+                }
+            };
+            match setup::run_as_admin(&exe, &["--rename", name, "--to", new_name]) {
+                Ok(()) => {}
+                Err(error) if error == CANCELLED => return false,
+                Err(error) => {
+                    error_alert(mtm, &strings::rename_failed(&error));
+                    return false;
+                }
+            }
+        }
+        Ok(response) => {
+            error_alert(mtm, &strings::rename_failed(response.message()));
+            return false;
+        }
+        Err(error) => {
+            error_alert(mtm, &call_text(&error));
+            return false;
+        }
+    }
+    log!("{}: renamed {}", name, new_name);
+    with_app(|app| app.renamed(name, new_name));
+    true
+}
+
 // --remove <name>, as root
 pub fn remove_command(name: &str) -> i32 {
     match ipc::call(&Request::Remove { name: name.to_string() }) {

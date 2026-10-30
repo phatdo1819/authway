@@ -62,7 +62,7 @@ the login, or whose server doesn't answer, never cuts the internet. With the log
 traffic and the DNS servers of the VPN come on. When the session ends, or the login page doesn't answer for 30
 seconds, they go off again until the next login.
 
-**All details**, on the page of a VPN (**Details...** in the menu on macOS), shows all of it, live: the state, the last handshake and the bytes; the
+**All details**, on the page of a VPN, shows all of it, live: the state, the last handshake and the bytes; the
 routing, a full tunnel (all the traffic) or a split tunnel with its networks; the addresses, DNS servers, MTU, listen
 port and public key of the computer; the address, port and public key of the server, its fallback addresses and the
 one in use, its keepalive, whether it has a preshared key; the login page and the session. Never a private or
@@ -288,8 +288,8 @@ update that keeps the VPNs and restarts the app, and a removal that leaves nothi
 
 ## macOS
 
-The same app for macOS 11 or later, Apple silicon and Intel in one package: the menu of Windows before its window
-(each VPN with its actions, the removal, the logs), the same login window, details,
+The same app for macOS 11 or later, Apple silicon and Intel in one package: the same window (the cards, the page of
+each VPN with its graph, its name and its login, the drop of a `.conf`), the same short menu, login window, details,
 fallback addresses and rules for the password, from the same code ([src/client](src/client),
 [src/manager.rs](src/manager.rs)); what differs is in [src/macos](src/macos).
 
@@ -298,8 +298,10 @@ fallback addresses and rules for the password, from the same code ([src/client](
 > on the first runs, and keep a way back to your usual network (`sudo …/uninstall.sh`).
 
 **For the users.** Open `authway-<version>-macos.pkg` and click **Continue**, **Install**: macOS asks for the
-password of an administrator, once. The icon is in the menu bar, and the app starts at every login; click the
-icon for the menu. Adding a VPN works as on Windows, and macOS asks for an administrator when the user isn't
+password of an administrator, once. The window of the app opens, and at every login, as on Windows; it follows the
+light and dark appearance, and Esc goes back from the page of a VPN. Closing it leaves the app in the menu bar, where
+its icon has the short menu, **Open Authway** first. The app is in the Dock and in Cmd+Tab only while the window is
+open; Cmd+Q quits it. Adding a VPN works as on Windows, and macOS asks for an administrator when the user isn't
 allowed. The notices are in the Notification Center: macOS asks once whether the app can show them.
 
 **For the administrators.**
@@ -339,7 +341,7 @@ sudo "/Library/Application Support/Authway/uninstall.sh"
  the user                                   root (launchd)
 ┌──────────────────────┐  Unix socket   ┌────────────────────────┐  control socket  ┌──────────────┐
 │ Authway.app          │◄──────────────►│ authway --service      │◄────────────────►│ wireguard-go │
-│ menu, login, details │  JSON, a line  │ /Library/Application   │  /var/run/       │ one per      │
+│ window, menu, login  │  JSON, a line  │ /Library/Application   │  /var/run/       │ one per      │
 └──────────────────────┘                │ Support/Authway        │  wireguard/      │ tunnel, utun │
                                         └────────────────────────┘                  └──────────────┘
 ```
@@ -388,7 +390,7 @@ tunnels; the test of the login on `127.0.0.2` needs `sudo ifconfig lo0 alias 127
 
 - Tested with a real NethSecurity server: not yet (the real driver only on 127.0.0.1). The two steps of a VPN with
   a login: not on the real driver nor on a Mac yet.
-- macOS: never run on a Mac yet, see above. The window is Windows only: on macOS the app is in the menu bar.
+- macOS: never run on a Mac yet, see above, its window neither ([src/macos/ui/home.rs](src/macos/ui/home.rs)).
 - No kill switch: when the tunnel is down, the traffic goes out of it; no block of the DNS outside of the tunnel.
 - The packages and the programs aren't signed by a known publisher: SmartScreen and Gatekeeper warn when they're
   downloaded.
