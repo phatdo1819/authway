@@ -326,12 +326,21 @@ fn device_state(result: &ApiResult) -> (bool, bool) {
     (open && !flag("enrollment_open"), open && flag("enrollment_open"))
 }
 
+// The ID of the device key of the tunnel, for the status: None when the service can't tell, so the login page doesn't
+// say whose device this is, rather than send this computer away by mistake
+fn device_key(tunnel: &str) -> Option<String> {
+    match ipc::call(&Request::DeviceKey { name: tunnel.to_string() }) {
+        Ok(response) if response.ok => response.device_key,
+        _ => None,
+    }
+}
+
 // A login, with the proof of this device when the server requires it: the challenge of a new status, signed by the
 // service. Once more with a new challenge if it expired meanwhile.
 fn log_in(tunnel: &str, page: &Page, interface: u32, username: &str, password: &str, code: &str) -> ApiResult {
     let mut result = ApiResult::default();
     for _ in 0..2 {
-        let status = api::status(page, interface);
+        let status = api::status(page, interface, None);
         let Some((challenge, machine_id)) = api::device_challenge(&status) else {
             return api::login(page, interface, username, password, code, None);
         };
@@ -748,7 +757,10 @@ impl<S: Shell> App<S> {
             }
         }
         for (name, generation, page, interface) in checks {
-            self.spawn(move || Event::Status { name, generation, result: api::status(&page, interface) });
+            self.spawn(move || {
+                let device = device_key(&name);
+                Event::Status { name, generation, result: api::status(&page, interface, device.as_deref()) }
+            });
         }
         for (name, generation, candidates, routes, interface) in searches {
             log!("{}: looking for the login page at {:?}", name, candidates);
@@ -849,15 +861,15 @@ impl<S: Shell> App<S> {
                 tunnel.on_up(now);
             }
             if was_up && !tunnel.info.up {
-                if !tunnel.stopping {
+                // turned off here: its window is gone already, or stays to say why
+                if !std::mem::take(&mut tunnel.stopping) {
                     log!("{}: disconnected by the service", tunnel.name());
                     if tunnel.announced {
                         notices.push(strings::notice_disconnected(&tunnel.title()));
                     }
+                    closed.push(tunnel.info.name.clone());
                 }
-                tunnel.stopping = false;
                 tunnel.set_off();
-                closed.push(tunnel.info.name.clone());
             }
             self.tunnels.push(tunnel);
         }
@@ -956,6 +968,9 @@ impl<S: Shell> App<S> {
     }
 
     fn apply_status(&mut self, index: usize, result: ApiResult) {
+        if result.status == 200 && api::other_device(&result) {
+            return self.step_back(index);
+        }
         let now = Instant::now();
         let name = self.tunnels[index].info.name.clone();
         let window = self.window_index(&name);
@@ -1178,9 +1193,32 @@ impl<S: Shell> App<S> {
         self.update_icon();
     }
 
+    // Another device is enrolled for this configuration: off at once, before any login, and it stays off. Its
+    // handshakes would take the connection of the enrolled device, and pause its session on the firewall. Turning it
+    // on again checks again. The login window stays, to say why.
+    fn step_back(&mut self, index: usize) {
+        let name = self.tunnels[index].info.name.clone();
+        log!("{}: enrolled on another device, disconnecting", name);
+        self.tunnels[index].error = Some(strings::ERROR_OTHER_DEVICE.to_string());
+        match self.window_index(&name) {
+            Some(window) => {
+                let window = &mut self.windows[window];
+                window.pending_submit = false;
+                window.view.set_busy(false);
+                window.view.set_error(Some(strings::ERROR_OTHER_DEVICE));
+            }
+            None => self.notify(strings::ERROR_OTHER_DEVICE, true, Some(&name)),
+        }
+        self.take_down(&name);
+    }
+
     // with the logout first, so the session of the firewall ends at once
     pub fn disconnect(&mut self, name: &str) {
         self.close_window(name);
+        self.take_down(name);
+    }
+
+    fn take_down(&mut self, name: &str) {
         let Some(index) = self.tunnel_index(name) else { return };
         let tunnel = &mut self.tunnels[index];
         if tunnel.stopping {
@@ -1799,6 +1837,42 @@ mod tests {
         app.on_logged_in("Office", false, Ok(Response::success()));
         app.on_status("Office", generation, status(logged_in));
         assert_eq!((app.tunnels[0].routes_asked, app.tunnels[0].unreachable_since), (Some(true), None));
+    }
+
+    #[test]
+    fn enrolled_on_another_device() {
+        let device = |this_device: &str| {
+            status(&format!(
+                r#"{{"authenticated":false,"otp_required":false,"device":{{"required":true,"enrolled":true,"enrollment_open":false{}}}}}"#,
+                this_device
+            ))
+        };
+        let (mut app, journal) = app();
+        office_on(&mut app);
+        let generation = app.tunnels[0].generation;
+        // this device, or a login page that doesn't know the IDs: the login as before
+        app.on_status("Office", generation, device(r#","this_device":true"#));
+        assert_eq!(app.tunnels[0].session, Session::NeedLogin);
+        app.on_status("Office", generation, device(""));
+        assert_eq!((app.tunnels[0].session, app.tunnels[0].stopping), (Session::NeedLogin, false));
+        // another device: off at once, no logout, the window says why
+        app.on_status("Office", generation, device(r#","this_device":false"#));
+        assert!(app.tunnels[0].stopping);
+        assert_eq!(app.tunnels[0].error.as_deref(), Some(strings::ERROR_OTHER_DEVICE));
+        assert!(journal.borrow().contains(&format!("error {:?}", Some(strings::ERROR_OTHER_DEVICE))));
+        // the list says it's off before the service answers: the window stays
+        let off = TunnelInfo { name: "Office".into(), login: Some("http://10.103.1.1:8181/".into()), ..TunnelInfo::default() };
+        app.on_list(Instant::now(), Ok(Response { ok: true, tunnels: vec![off], ..Response::default() }));
+        app.on_down("Office", Ok(Response::success()));
+        assert_eq!((app.windows.len(), app.tunnels[0].info.up), (1, false));
+        assert_eq!(app.tunnels[0].describe(), strings::STATE_FAILED);
+        // without a window: a notice
+        let (mut app, journal) = super::tests::app();
+        office_on(&mut app);
+        let generation = app.tunnels[0].generation;
+        app.on_status("Office", generation, device(r#","this_device":false"#));
+        assert!(app.windows.is_empty() && app.tunnels[0].stopping);
+        assert!(journal.borrow().contains(&format!("notify true {}", strings::ERROR_OTHER_DEVICE)));
     }
 
     #[test]

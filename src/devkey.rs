@@ -111,7 +111,18 @@ fn open_or_create(tunnel: &str, id: &store::Id) -> Result<KeyHandle, String> {
 
 // The public key of the tunnel, 04 || X || Y
 pub fn public_point(tunnel: &str, id: &store::Id) -> Result<[u8; 65], String> {
-    let key = open_or_create(tunnel, id)?;
+    point_of(&open_or_create(tunnel, id)?)
+}
+
+// The same, None when the tunnel has no key yet: it never logged in on a server that requires device binding
+pub fn existing_point(_tunnel: &str, id: &store::Id) -> Result<Option<[u8; 65]>, String> {
+    match open(&Provider::open()?, id)? {
+        Some(key) => point_of(&key).map(Some),
+        None => Ok(None),
+    }
+}
+
+fn point_of(key: &KeyHandle) -> Result<[u8; 65], String> {
     let header = std::mem::size_of::<BCRYPT_ECCKEY_BLOB>();
     let mut blob = vec![0u8; header + 64];
     let mut size = 0u32;
@@ -333,9 +344,14 @@ mod tests {
     #[test]
     fn keys_sign_for_openssl() {
         let id = crate::win::new_guid();
+        // none until a login needs one: its ID is empty
+        assert_eq!(existing_point("test", &id).unwrap(), None);
+        assert_eq!(crate::device::key_id("test", &id).unwrap(), "");
         let point = public_point("test", &id).unwrap();
         // the same key the second time
         assert_eq!(public_point("test", &id).unwrap(), point);
+        assert_eq!(existing_point("test", &id).unwrap(), Some(point));
+        assert_eq!(crate::device::key_id("test", &id).unwrap(), crate::device::id_of(&point));
         let data = crate::device::message("C1", "S", "P", "10.103.1.2", "alice", "");
         let signature = sign("test", &id, &data).unwrap();
         assert_eq!(signature[0], 0x30);

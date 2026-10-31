@@ -77,8 +77,12 @@ pub const ERROR_FAILED: &str = "The login didn't work. Try again in a moment.";
 // with device binding
 pub const ERROR_NOT_ENROLLED: &str = "No device is enrolled for this VPN configuration, and a new one can't enroll. \
                                       Contact your administrator.";
-pub const ERROR_DEVICE_MISMATCH: &str = "This VPN configuration is enrolled on another device: it works only there. \
-                                         Contact your administrator to use it on this computer.";
+pub const ERROR_DEVICE_MISMATCH: &str = "This VPN configuration is enrolled on another device and works only there: \
+                                         your username and password weren't checked. Contact your administrator to \
+                                         use it on this computer.";
+// said by the status, before any login
+pub const ERROR_OTHER_DEVICE: &str = "This VPN configuration is enrolled on another device and works only there. \
+                                      Contact your administrator to use it on this computer.";
 pub const ERROR_DEVICE_REQUIRED: &str = "This VPN requires a login signed by the enrolled device, and this one \
                                          couldn't be signed. Try again, or contact your administrator.";
 pub const NOTICE_ENROLL: &str = "Your first login enrolls this computer: then this VPN works only here.";

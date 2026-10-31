@@ -449,6 +449,21 @@ impl Manager {
             Request::Sign { name, host, challenge, username, machine_id } => {
                 self.sign(&name, host, &challenge, &username, machine_id)
             }
+            Request::DeviceKey { name } => self.device_key(&name),
+        }
+    }
+
+    // the ID of the device key of a tunnel: whose it is, not the key
+    fn device_key(&mut self, name: &str) -> Response {
+        let Some(entry) = self.find(name) else {
+            return Response::failure(ipc::NOT_FOUND, format!("There's no VPN named {}.", name));
+        };
+        match device::key_id(&entry.name, &entry.id) {
+            Ok(id) => Response { ok: true, device_key: Some(id), ..Response::default() },
+            Err(error) => {
+                log!("{}: can't read the device key: {}", entry.name, error);
+                Response::failure(ipc::FAILED, format!("This computer can't read its device key: {}.", error))
+            }
         }
     }
 

@@ -56,6 +56,8 @@ pub enum Request {
         #[serde(default)]
         machine_id: bool,
     },
+    // the ID of the device key of a tunnel, for the status of the login page, see device.rs
+    DeviceKey { name: String },
 }
 
 // the errors of the service
@@ -78,6 +80,9 @@ pub struct Response {
     // the answer to Sign
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device: Option<crate::device::Proof>,
+    // the answer to DeviceKey: empty when the tunnel has no key yet
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_key: Option<String>,
     // whether the user who asked can add and remove tunnels without asking to be administrator
     #[serde(default)]
     pub can_manage: bool,
@@ -426,6 +431,8 @@ mod tests {
         let back: Request = serde_json::from_str(r#"{"op":"import","name":"Office","config":"x"}"#).unwrap();
         assert!(matches!(back, Request::Import { replace: false, .. }));
         assert_eq!(serde_json::to_string(&Request::List).unwrap(), r#"{"op":"list"}"#);
+        let request = Request::DeviceKey { name: "Office".into() };
+        assert_eq!(serde_json::to_string(&request).unwrap(), r#"{"op":"device_key","name":"Office"}"#);
         let response = Response::failure(ACCESS_DENIED, "only administrators");
         let back: Response = serde_json::from_str(&serde_json::to_string(&response).unwrap()).unwrap();
         assert_eq!((back.ok, back.error_code(), back.message()), (false, ACCESS_DENIED, "only administrators"));

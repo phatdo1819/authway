@@ -1,5 +1,6 @@
 // The JSON API of the login page of ns-wgauth, reachable only through the tunnel:
 //   GET  /api/status   {"authenticated", "otp_required", "server", "user", "expires", "blocked", "no_user", "device"}
+//        ?device=<ID>  the ID of the device key, see device.rs: with device binding, "device" says "this_device"
 //   POST /api/login    {"username", "password", "otp", "device"}, "device" signed by the service, see device.rs
 //   POST /api/logout
 // Plain HTTP to an address of the tunnel, never through a proxy. The requests go out only through the network
@@ -148,8 +149,21 @@ impl fmt::Display for ApiResult {
     }
 }
 
-pub fn status(page: &Page, interface: u32) -> ApiResult {
-    send("GET", page, interface, "/api/status", None, REQUEST_TIMEOUT)
+// With the ID of the device key, empty when there's none: None when it isn't known, the page then can't say whose
+// device this is
+pub fn status(page: &Page, interface: u32, device: Option<&str>) -> ApiResult {
+    match device.filter(|id| id.bytes().all(|byte| byte.is_ascii_hexdigit())) {
+        Some(id) => send("GET", page, interface, &format!("/api/status?device={}", id), None, REQUEST_TIMEOUT),
+        None => send("GET", page, interface, "/api/status", None, REQUEST_TIMEOUT),
+    }
+}
+
+// Whether the status says another device is enrolled for this configuration: only a login page that knows the ID of
+// the device key sent says it
+pub fn other_device(status: &ApiResult) -> bool {
+    let device = status.data.get("device").and_then(Value::as_object);
+    let flag = |key: &str| device.and_then(|device| device.get(key)).and_then(Value::as_bool);
+    flag("required") == Some(true) && flag("enrolled") == Some(true) && flag("this_device") == Some(false)
 }
 
 pub fn login(
@@ -468,7 +482,7 @@ mod tests {
         // in the routes
         let found = discover(&[ip("127.0.0.1")], &[net("127.0.0.0/8")], loopback, login_port, web_port);
         assert_eq!(found, Some(page));
-        assert!(status(&page, loopback).get_bool("otp_required"));
+        assert!(status(&page, loopback, None).get_bool("otp_required"));
         let before = logins.load(Ordering::SeqCst);
 
         // through another network adapter, or one not known yet: nothing is sent

@@ -102,7 +102,15 @@ fn load_or_create(tunnel: &str) -> Result<SecKey, String> {
 
 // The public key of the tunnel, 04 || X || Y
 pub fn public_point(tunnel: &str, _id: &store::Id) -> Result<[u8; 65], String> {
-    let key = load_or_create(tunnel)?;
+    point_of(&load_or_create(tunnel)?)
+}
+
+// The same, None when the tunnel has no key yet: it never logged in on a server that requires device binding
+pub fn existing_point(tunnel: &str, _id: &store::Id) -> Result<Option<[u8; 65]>, String> {
+    load(tunnel)?.map(|key| point_of(&key)).transpose()
+}
+
+fn point_of(key: &SecKey) -> Result<[u8; 65], String> {
     let public = key.public_key().ok_or("no public key")?;
     let data = public.external_representation().ok_or("the public key can't be read")?;
     data.bytes().try_into().map_err(|_| "not a P-256 public key".to_string())

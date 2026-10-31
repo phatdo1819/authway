@@ -54,6 +54,17 @@ pub fn spki(point: &[u8; 65]) -> Vec<u8> {
     der
 }
 
+// The ID of a device key, as the login page knows it: the SHA-256 of its DER public key, in hex
+pub fn id_of(point: &[u8; 65]) -> String {
+    digest::hex(&digest::sha256(&spki(point)))
+}
+
+// The ID of the key of the tunnel, empty when it has none yet: the login page then knows this computer isn't the
+// enrolled one. No key is made for it, a server without device binding never needs one.
+pub fn key_id(tunnel: &str, id: &store::Id) -> Result<String, String> {
+    Ok(devkey::existing_point(tunnel, id)?.map(|point| id_of(&point)).unwrap_or_default())
+}
+
 // The DER form of an ECDSA signature given as r and s, 32 bytes each
 pub fn der_signature(raw: &[u8; 64]) -> Vec<u8> {
     fn integer(value: &[u8]) -> Vec<u8> {
@@ -171,6 +182,8 @@ mod tests {
         let der = spki(&point);
         assert_eq!(der.len(), 91);
         assert_eq!(&der[..2], &[0x30, 0x59]);
+        // the same as nethsec.wgauth.device_key_id on the firewall
+        assert_eq!(id_of(&point), "4bc1fd1a02bd2365584af4f2ed045fad3e6e83d3ec744395310511277913ee7c");
         assert_eq!(conf::base64(&[1, 2, 3, 4]), "AQIDBA==");
         assert_eq!(conf::base64(b"ab"), "YWI=");
         assert_eq!(conf::base64(b""), "");

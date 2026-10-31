@@ -61,8 +61,10 @@ the texts and the scale of each display, Tab, Space and Enter work in it, and hi
 the system.
 
 When the server requires device binding, the first login enrolls this computer: the window says so. The VPN then
-works only on this computer, even for someone who has the file and the password. On a new computer, or after
-removing the VPN from the app, ask the administrator to allow a new device.
+works only on this computer, even for someone who has the file and the password. On another computer the app turns
+the VPN off a second or two after it comes up, before any login, and says it's enrolled on another device: its
+connection would take the one of the enrolled computer. On a new computer, or after removing the VPN from the app,
+ask the administrator to allow a new device.
 
 When the session ends on the firewall (it expired, or the computer changed network), the window opens again with the
 username and the saved password: only the code is needed. **Cancel** or **Disconnect** turns the tunnel off; the
@@ -221,7 +223,10 @@ reg add "HKLM\SOFTWARE\Policies\Authway" /v AllowUserImport /t REG_DWORD /d 1 /f
   password, doesn't work on another computer. When the server asks for the machine ID too, the service adds an
   HMAC of the hardware ID of the computer (SMBIOS UUID, else `MachineGuid`; `IOPlatformUUID` on macOS), keyed with
   the public key of the server, so the server never sees the ID. Removing the VPN removes its key: added again, it
-  needs a new enrollment, which the administrator allows.
+  needs a new enrollment, which the administrator allows. Every status asks with the ID of the key, its SHA-256
+  (empty when the tunnel has none, and no key is made for that): when the page answers that another device is
+  enrolled (`this_device` false), the app takes the tunnel down at once and doesn't connect again by itself. A
+  firewall without this answer changes nothing.
 - **The passwords** are in the Credential Manager of the user (`Authway/http://10.103.1.1:8181`), on this
   computer only, if the user checked "Remember my password".
 - **The pipe** lets the signed-in users read and write, not create another instance of it; the app checks that the
