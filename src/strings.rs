@@ -146,8 +146,34 @@ pub fn import_needs_admin() -> String {
 }
 pub const IMPORT_SAVED: &str =
     "The configuration is saved on this computer, protected: only the VPN service can read its keys.";
-pub const IMPORT_CONNECT: &str = "Connect now";
-pub const IMPORT_LATER: &str = "Close";
+
+// the choices once a VPN is added from a file, with the second line that the Windows dialog shows under each
+pub const IMPORT_CONNECT_DELETE: &str = "Connect and delete the file";
+pub const IMPORT_CONNECT_KEEP: &str = "Connect and keep the file";
+pub const IMPORT_LATER: &str = "Not now";
+
+pub fn import_file_note(file: &str) -> String {
+    format!(
+        "{} still holds the keys, readable by anyone who gets the file: delete it unless you need it for another device.",
+        file
+    )
+}
+
+pub fn import_connect_delete_note(file: &str) -> String {
+    format!("Recommended: {} isn't needed anymore.", file)
+}
+
+pub const IMPORT_CONNECT_KEEP_NOTE: &str = "Delete it yourself once you don't need it.";
+
+pub fn import_later_note(name: &str) -> String {
+    format!("{} waits in the list, off. The file stays.", name)
+}
+
+// the error of the system without its code, which the log keeps
+pub fn import_not_deleted(file: &str, error: &str) -> String {
+    let error = error.split(" (os error ").next().unwrap_or(error);
+    format!("Can't delete {}: {}\n\nDelete it yourself: it holds the keys of the VPN.", file, error)
+}
 
 pub fn import_invalid(error: &str) -> String {
     format!("This file isn't a VPN configuration that can be used:\n\n{}", error)
@@ -157,16 +183,34 @@ pub fn import_unreadable(error: &str) -> String {
     format!("Can't read the file: {}", error)
 }
 
+// a file for the name of a VPN already there: keep both or replace it, with the second line of each on Windows
 pub fn import_exists(name: &str) -> String {
-    format!("There's already a VPN named {}. Replace it with this file?", name)
+    format!("There's already a VPN named {}", name)
+}
+
+pub fn import_exists_note(name: &str) -> String {
+    format!("This file may be a new version of {}, or the VPN of another user or device on the same server.", name)
+}
+
+pub const IMPORT_KEEP_BOTH: &str = "Keep both";
+
+pub fn import_keep_both_note(other: &str) -> String {
+    format!("Add this file as {}.", other)
+}
+
+pub fn import_replace(name: &str) -> String {
+    format!("Replace {}", name)
+}
+
+pub const IMPORT_REPLACE_NOTE: &str = "Its current settings are lost.";
+
+// the same notes, under the question on macOS
+pub fn import_exists_choices(name: &str, other: &str) -> String {
+    format!("{} adds this file as {}. {} loses the current settings of {}.", IMPORT_KEEP_BOTH, other, REPLACE, name)
 }
 
 pub fn import_ready(name: &str) -> String {
     format!("{} is ready", name)
-}
-
-pub fn import_delete_file(file: &str) -> String {
-    format!("Delete the file {}: it isn't needed anymore", file)
 }
 
 // --import with --username and --password
@@ -442,5 +486,16 @@ mod tests {
         assert_eq!(value_duration(0), "0:00");
         assert_eq!(value_duration(754), "12:34");
         assert_eq!(value_duration(3723), "1:02:03");
+    }
+
+    #[test]
+    fn not_deleted() {
+        let error = "The process cannot access the file because it is being used by another process. (os error 32)";
+        assert_eq!(
+            import_not_deleted("Office.conf", error),
+            "Can't delete Office.conf: The process cannot access the file because it is being used by another \
+             process.\n\nDelete it yourself: it holds the keys of the VPN."
+        );
+        assert!(import_not_deleted("Office.conf", "Permission denied").contains(": Permission denied\n"));
     }
 }

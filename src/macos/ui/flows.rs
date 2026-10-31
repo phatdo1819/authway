@@ -9,13 +9,16 @@ use std::process::Command;
 use std::time::Duration;
 
 use objc2::MainThreadMarker;
-use objc2_app_kit::{NSAlert, NSAlertStyle, NSApplication, NSControlStateValueOn, NSModalResponseOK, NSOpenPanel};
+use objc2_app_kit::{
+    NSAlert, NSAlertFirstButtonReturn, NSAlertSecondButtonReturn, NSAlertStyle, NSApplication, NSModalResponseOK,
+    NSOpenPanel,
+};
 use objc2_foundation::NSArray;
 use objc2_uniform_type_identifiers::UTType;
 
 use super::{activate, alert, error_alert, ns, with_app};
 use crate::api;
-use crate::client::import::{load, login_page, name_for, Login};
+use crate::client::import::{is_taken, load, login_page, name_for, other_name, Duplicate, Login, Ready};
 use crate::creds;
 use crate::ipc::{self, CallError, Request};
 use crate::log;
@@ -97,13 +100,16 @@ pub fn import_path(mtm: MainThreadMarker, path: &Path) {
         Ok(loaded) => loaded,
         Err(message) => return error_alert(mtm, &message),
     };
-    let name = name_for(&config, path);
+    let mut name = name_for(&config, path);
+    let mut replace = false;
     let known = with_app(|app| app.tunnel_names()).unwrap_or_default();
-    let replace = known.iter().any(|known| known.eq_ignore_ascii_case(&name));
-    if replace
-        && alert(mtm, &strings::import_exists(&name), None, NSAlertStyle::Warning, &[strings::REPLACE, strings::CANCEL]) != 0
-    {
-        return;
+    if is_taken(&name, &known) {
+        let other = other_name(&name, &known);
+        match duplicate_dialog(mtm, &name, &other) {
+            Duplicate::KeepBoth => name = other,
+            Duplicate::Replace => replace = true,
+            Duplicate::Cancel => return,
+        }
     }
     match ipc::call(&Request::Import { name: name.clone(), config: text.clone(), replace }) {
         Ok(response) if response.ok => {}
@@ -119,34 +125,46 @@ pub fn import_path(mtm: MainThreadMarker, path: &Path) {
     log!("{}: added from {}", name, path.display());
     with_app(|app| app.list_soon());
     let file = path.file_name().map(|file| file.to_string_lossy().to_string()).unwrap_or_default();
-    let (connect, delete) = ready_dialog(mtm, &name, &file);
-    if delete {
+    let ready = ready_dialog(mtm, &name, &file);
+    if ready.deletes() {
         if let Err(error) = fs::remove_file(path) {
             log!("can't delete {}: {}", path.display(), error);
+            alert(mtm, &strings::import_not_deleted(&file, &error.to_string()), None, NSAlertStyle::Warning, &["OK"]);
         }
     }
-    if connect {
+    if ready.connects() {
         with_app(|app| app.connect(&name));
     }
 }
 
-// "Office is ready": connect now or later, and delete the file, checked
-fn ready_dialog(mtm: MainThreadMarker, name: &str, file: &str) -> (bool, bool) {
+// "There's already a VPN named Office": keep both (the default, Return: nothing is lost), replace it, or Cancel (Esc)
+fn duplicate_dialog(mtm: MainThreadMarker, name: &str, other: &str) -> Duplicate {
+    let detail = format!("{}\n\n{}", strings::import_exists_note(name), strings::import_exists_choices(name, other));
+    let buttons = [strings::IMPORT_KEEP_BOTH, strings::REPLACE, strings::CANCEL];
+    match alert(mtm, &strings::import_exists(name), Some(&detail), NSAlertStyle::Warning, &buttons) {
+        0 => Duplicate::KeepBoth,
+        1 => Duplicate::Replace,
+        _ => Duplicate::Cancel,
+    }
+}
+
+// "Office is ready", and three buttons: connect and delete the file (the default, Return), connect and keep it, not
+// now (Esc)
+fn ready_dialog(mtm: MainThreadMarker, name: &str, file: &str) -> Ready {
     activate(mtm);
     let alert = NSAlert::new(mtm);
     alert.setMessageText(&ns(&strings::import_ready(name)));
-    alert.setInformativeText(&ns(strings::IMPORT_SAVED));
+    alert.setInformativeText(&ns(&format!("{}\n\n{}", strings::IMPORT_SAVED, strings::import_file_note(file))));
     alert.setAlertStyle(NSAlertStyle::Informational);
-    alert.addButtonWithTitle(&ns(strings::IMPORT_CONNECT));
-    alert.addButtonWithTitle(&ns(strings::IMPORT_LATER));
-    alert.setShowsSuppressionButton(true);
-    let delete = alert.suppressionButton();
-    if let Some(button) = &delete {
-        button.setTitle(&ns(&strings::import_delete_file(file)));
-        button.setState(NSControlStateValueOn);
+    alert.addButtonWithTitle(&ns(strings::IMPORT_CONNECT_DELETE));
+    alert.addButtonWithTitle(&ns(strings::IMPORT_CONNECT_KEEP));
+    let later = alert.addButtonWithTitle(&ns(strings::IMPORT_LATER));
+    later.setKeyEquivalent(&ns("\u{1b}"));
+    match alert.runModal() {
+        response if response == NSAlertFirstButtonReturn => Ready::ConnectAndDelete,
+        response if response == NSAlertSecondButtonReturn => Ready::Connect,
+        _ => Ready::Later,
     }
-    let connect = alert.runModal() == objc2_app_kit::NSAlertFirstButtonReturn;
-    (connect, delete.is_some_and(|button| button.state() == NSControlStateValueOn))
 }
 
 // --import <file> --name <name> [--replace], as root: the errors go to the app through osascript. With

@@ -34,7 +34,10 @@ All the names of the app are in [src/product.rs](src/product.rs), and the name o
 1. Open `authway-<version>-x64.msi`, or `-arm64.msi` on a Windows on ARM computer, and click **Next**,
    **Install**. Windows asks for the permission of an administrator, once.
 2. The window of the app opens, and at every sign-in. Click **Add VPN** and choose the `.conf` file of the
-   administrator, or drop the file on the window. The app saves it protected and offers to delete the file.
+   administrator, or drop the file on the window. The app saves it protected, then offers **Connect and delete the
+   file** (recommended: the file holds the keys), **Connect and keep the file** or **Not now**. The VPN takes the
+   name of the server, so a second file of the same server, for another user for example, asks first: **Keep both**
+   adds it as `Office 2`, **Replace** puts it in the place of the VPN already there.
 3. Turn on the switch of the VPN: the login window asks for username, password and code while the tunnel comes up.
    The sixth digit of the code connects.
 
