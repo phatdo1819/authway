@@ -10,16 +10,15 @@ WireGuard server, without a login.
 > [!WARNING]
 > **Authway is a proof of concept**, not a finished product: it was made to try the login of ns-wgauth from a
 > client that logs in by itself. **It was written by an AI** (Claude, by Anthropic), directed and tested by one
-> person. No security expert has reviewed it, it hasn't been tested against a real NethSecurity server yet, and the
-> macOS version has never run on a Mac. A VPN client handles your traffic and your passwords: read the code before
-> you trust it, don't use it in production, and use it at your own risk.
+> person, **in virtual machines only**: a NethSecurity test firewall and Windows and macOS clients, see
+> [The test machines](#the-test-machines). No security expert has reviewed it. A VPN client handles your traffic and
+> your passwords: read the code before you trust it, don't use it in production, and use it at your own risk.
 
 | The VPNs | The page of a VPN | The login |
 | --- | --- | --- |
 | <img src="docs/screenshots/main-window.png" alt="The main window: three VPNs, one waiting for the login with its Log in button, two connected with their speeds" width="280"> | <img src="docs/screenshots/vpn-page.png" alt="The page of a VPN: connected as alice, the traffic graph, the speeds, the bytes, the address and the routing" width="280"> | <img src="docs/screenshots/login-window.png" alt="The login window: username, password and the code of the authenticator app" width="280"> |
 
-Authway on Windows, with made-up names and documentation addresses. There's no picture of the macOS version: it
-hasn't run on a Mac yet.
+Authway on Windows, with made-up names and documentation addresses. There's no picture of the macOS version yet.
 
 To set up the firewall side and test both together, follow
 [WGAUTH-TESTING.md](https://github.com/phatdo1819/nethsecurity/blob/ci-wgauth/WGAUTH-TESTING.md) on the
@@ -261,6 +260,19 @@ Windows.
 cargo test --features testing
 ```
 
+### The test machines
+
+The tests with a real firewall ran in virtual machines, all on one local network:
+
+- **The test firewall**: NethSecurity in a virtual machine, built from the fork with
+  [ns-wgauth](https://github.com/phatdo1819/nethsecurity/tree/ci-wgauth/packages/ns-wgauth): its WireGuard servers
+  with the login, device binding, the fallback addresses and the copy detection.
+- **The clients**: a Windows 11 virtual machine and a macOS virtual machine, each with Authway installed from its
+  package, with the real WireGuard drivers.
+
+Not tested: physical computers, a firewall in production, clients behind other networks across the internet, and
+many users at once. The rest of this section tells what the unit and end-to-end tests check on one computer.
+
 The `testing` feature makes a build for the tests only: the service runs as the user (`--service-console`) with
 fake tunnels, its pipe, its keys in `HKCU\Software\Authway test` and its credentials have other names, so it never
 touches an installed app. The end-to-end test drove that build against the real code of the ns-wgauth daemon: import,
@@ -296,8 +308,9 @@ On the real driver, two WireGuardNT adapters on 127.0.0.1 were used, the Endpoin
 Device binding: the unit tests check SHA-256 and HMAC-SHA256 with the published vectors, the DER of the signatures,
 the message, the SMBIOS UUID (byte order, placeholders) and a real key of the Microsoft Software Key Storage
 Provider, whose signature `openssl dgst -verify` accepts, as the firewall does. A proof made by `device::prove` was
-also accepted by the `verify_device` of the firewall, and refused with another user, address or server. Not tested
-yet: against a real firewall, and the key of macOS.
+also accepted by the `verify_device` of the firewall, and refused with another user, address or server. On the test
+machines, the Windows and the macOS client each enrolled their VPN on the test firewall, and a copy of the same
+`.conf` on the other computer was refused.
 
 The MSI package for ARM64 was tested as administrator on Windows 11: the x64 one refused, the install, the rights
 and restarts of the service, two tunnels through the installed `wireguard.dll`, the steps for the apps as SYSTEM, an
@@ -311,8 +324,9 @@ fallback addresses and rules for the password, from the same code ([src/client](
 [src/manager.rs](src/manager.rs)); what differs is in [src/macos](src/macos).
 
 > [!IMPORTANT]
-> The macOS version is written and compiles for both processors, but it **hasn't run on a Mac yet**: expect bugs
-> on the first runs, and keep a way back to your usual network (`sudo …/uninstall.sh`).
+> The macOS version compiles for both processors, but it has run only in a macOS virtual machine, see
+> [The test machines](#the-test-machines): expect bugs on a real Mac, and keep a way back to your usual network
+> (`sudo …/uninstall.sh`).
 
 **For the users.** Open `authway-<version>-macos.pkg` and click **Continue**, **Install**: macOS asks for the
 password of an administrator, once. The window of the app opens, and at every login, as on Windows; it follows the
@@ -405,9 +419,8 @@ tunnels; the test of the login on `127.0.0.2` needs `sudo ifconfig lo0 alias 127
 
 ## Not done yet
 
-- Tested with a real NethSecurity server: not yet (the real driver only on 127.0.0.1). The two steps of a VPN with
-  a login: not on the real driver nor on a Mac yet.
-- macOS: never run on a Mac yet, see above, its window neither ([src/macos/ui/home.rs](src/macos/ui/home.rs)).
+- Tested in virtual machines only, see [The test machines](#the-test-machines): not on physical computers, nor on
+  a firewall in production.
 - No kill switch: when the tunnel is down, the traffic goes out of it; no block of the DNS outside of the tunnel.
 - The packages and the programs aren't signed by a known publisher: SmartScreen and Gatekeeper warn when they're
   downloaded.
