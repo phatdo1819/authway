@@ -20,6 +20,10 @@ WireGuard server, without a login.
 
 Authway on Windows, with made-up names and documentation addresses. There's no picture of the macOS version yet.
 
+**Download**: the installers for Windows and macOS are in the
+[releases](https://github.com/phatdo1819/authway/releases). They aren't signed by a known publisher, so Windows and
+macOS warn before installing them: see [For the users](#for-the-users) and [macOS](#macos).
+
 To set up the firewall side and test both together, follow
 [WGAUTH-TESTING.md](https://github.com/phatdo1819/nethsecurity/blob/ci-wgauth/WGAUTH-TESTING.md) on the
 `ci-wgauth` branch of the NethSecurity fork: steps 1–7 for the login, step 8 for the fallback addresses, step 9
@@ -30,8 +34,10 @@ All the names of the app are in [src/product.rs](src/product.rs), and the name o
 
 ## For the users
 
-1. Open `authway-<version>-x64.msi`, or `-arm64.msi` on a Windows on ARM computer, and click **Next**,
-   **Install**. Windows asks for the permission of an administrator, once.
+1. Download `authway-<version>-x64-unsigned.msi` from the [releases](https://github.com/phatdo1819/authway/releases),
+   or `-arm64-unsigned.msi` on a Windows on ARM computer. Open it and click **Next**, **Install**. Windows asks for
+   the permission of an administrator, once. The package isn't signed: when SmartScreen says *Windows protected your
+   PC*, click **More info**, then **Run anyway**. With Smart App Control on, Windows refuses it.
 2. The window of the app opens, and at every sign-in. Click **Add VPN** and choose the `.conf` file of the
    administrator, or drop the file on the window. The app saves it protected, then offers **Connect and delete the
    file** (recommended: the file holds the keys), **Connect and keep the file** or **Not now**. The VPN takes the
@@ -88,11 +94,11 @@ The MSI package installs for the whole computer, so Intune, Group Policy or any 
 can install it. As administrator, without windows:
 
 ```
-msiexec /i authway-0.1.0-x64.msi /qn
+msiexec /i authway-0.1.0-x64-unsigned.msi /qn
 "C:\Program Files\Authway\authway.exe" --import "C:\path\office.conf" --name "Office"
 "C:\Program Files\Authway\authway.exe" --rename "Office" --to "Head office"
 "C:\Program Files\Authway\authway.exe" --remove "Office"
-msiexec /x authway-0.1.0-x64.msi /qn
+msiexec /x authway-0.1.0-x64-unsigned.msi /qn
 ```
 
 - **Install**: the app starts at once for every user signed in, and at every sign-in after, with its window unless
@@ -136,7 +142,7 @@ can connect and disconnect the VPNs that are there; no group membership is neede
 them without that permission:
 
 - check **Every user of this computer** on the page *Who can add VPNs* of the setup, or install with
-  `msiexec /i authway-0.1.0-x64.msi /qn ALLOWUSERIMPORT=1`. An update keeps the choice; `ALLOWUSERIMPORT=0`
+  `msiexec /i authway-0.1.0-x64-unsigned.msi /qn ALLOWUSERIMPORT=1`. An update keeps the choice; `ALLOWUSERIMPORT=0`
   takes it back. The setup saves it as `AllowUserImport` = 1 in `HKLM\SOFTWARE\Authway`.
 - or the policy `AllowUserImport` = 1, below: it applies at once, and the policy, 0 or 1, wins over the setup.
 
@@ -247,6 +253,9 @@ powershell -File tools\fetch-wireguard.ps1     # wireguard.dll for x64 and ARM64
 powershell -File tools\dist.ps1                # dist\authway-<version>-x64.msi and -arm64.msi
 ```
 
+The packages of the [releases](https://github.com/phatdo1819/authway/releases) are these files, with `-unsigned`
+added to their names.
+
 `dist.ps1` finds WiX through `%WIX%`, set by its setup, or `-Wix <its bin folder>`. It passes the names of
 `src\product.rs` and the version of `Cargo.toml` to the package: change them there, never in the `.wxs`. Keep
 `UPGRADE_CODE` forever, or a new version doesn't replace the installed one.
@@ -328,17 +337,21 @@ fallback addresses and rules for the password, from the same code ([src/client](
 > [The test machines](#the-test-machines): expect bugs on a real Mac, and keep a way back to your usual network
 > (`sudo …/uninstall.sh`).
 
-**For the users.** Open `authway-<version>-macos.pkg` and click **Continue**, **Install**: macOS asks for the
-password of an administrator, once. The window of the app opens, and at every login, as on Windows; it follows the
-light and dark appearance, and Esc goes back from the page of a VPN. Closing it leaves the app in the menu bar, where
-its icon has the short menu, **Open Authway** first. The app is in the Dock and in Cmd+Tab only while the window is
-open; Cmd+Q quits it. Adding a VPN works as on Windows, and macOS asks for an administrator when the user isn't
-allowed. The notices are in the Notification Center: macOS asks once whether the app can show them.
+**For the users.** Download `authway-<version>-macos-unsigned.pkg` from the
+[releases](https://github.com/phatdo1819/authway/releases), open it and click **Continue**, **Install**: macOS asks
+for the password of an administrator, once. The package isn't notarized: when macOS says it can't check it for
+malicious software, open **System Settings → Privacy & Security** and click **Open Anyway** (on macOS 14 and
+earlier, Control-click the package and choose **Open** works too). The window of the app opens, and at every login,
+as on Windows; it follows the light and dark appearance, and Esc goes back from the page of a VPN. Closing it leaves
+the app in the menu bar, where its icon has the short menu, **Open Authway** first. The app is in the Dock and in
+Cmd+Tab only while the window is open; Cmd+Q quits it. Adding a VPN works as on Windows, and macOS asks for an
+administrator when the user isn't allowed. The notices are in the Notification Center: macOS asks once whether the
+app can show them.
 
 **For the administrators.**
 
 ```
-sudo installer -pkg authway-0.1.0-macos.pkg -target /
+sudo installer -pkg authway-0.1.0-macos-unsigned.pkg -target /
 sudo /Applications/Authway.app/Contents/MacOS/authway --import ~/Downloads/office.conf --name "Office"
 sudo /Applications/Authway.app/Contents/MacOS/authway --remove "Office"
 sudo "/Library/Application Support/Authway/uninstall.sh"
@@ -407,6 +420,8 @@ rustup target add aarch64-apple-darwin x86_64-apple-darwin
 tools/fetch-wireguard-go.sh      # wireguard-go from its source, checked, for both processors
 tools/dist-macos.sh              # dist/authway-<version>-macos.pkg
 ```
+
+The package of the releases is this file, built without the certificates below, with `-unsigned` added to its name.
 
 The package is signed ad hoc, which is enough for the Mac that builds it. For other Macs, sign it with the
 certificates of an Apple developer account (`SIGN_APP="Developer ID Application: ..."`, `SIGN_PKG="Developer ID
