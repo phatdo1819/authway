@@ -8,13 +8,18 @@ use std::thread;
 use std::time::Instant;
 
 use crate::api::Page;
-use crate::conf::{self, Config, IpNet};
+use crate::conf::{self, Config, IpNet, OwnKeys};
 use crate::failover::{self, Failover, Next, Poll};
 use crate::ipc::{self, PeerInfo, Request, Response, TunnelInfo};
 use crate::log;
 use crate::store;
 use crate::time::unix_now;
-use crate::{device, devkey};
+use crate::{device, devkey, x25519};
+
+// seconds of packets sent without a handshake for a new private key: the server may take another one of the tunnel
+const KEY_SILENCE: u64 = 30;
+// the same for a key that worked: longer than WireGuard keeps a session, 180 seconds
+const KEY_LOST: u64 = 200;
 
 // What the tunnel says of a server
 pub struct PeerStats {
@@ -34,6 +39,8 @@ pub trait Tunnel: Send {
     fn interface(&self) -> u32;
     // another address for a server, a fallback
     fn set_endpoint(&mut self, public_key: &conf::Key, address: SocketAddr) -> Result<(), String>;
+    // another private key for the tunnel, see conf::OwnKeys: the servers stay, the next packet makes a handshake
+    fn set_private_key(&mut self, key: &conf::Key) -> Result<(), String>;
     // the routes and the DNS servers of Steps::after on, or off again
     fn after_login(&mut self, _on: bool) -> Result<(), String> {
         Ok(())
@@ -91,6 +98,25 @@ struct Active {
     failovers: Vec<Option<Failover>>,
     // the routes and the DNS servers of after the login are on
     logged_in: bool,
+    key: KeyUse,
+}
+
+// The private key a tunnel that's on uses, and whether the server takes it: a handshake came after it was set
+struct KeyUse {
+    key: conf::Key,
+    // seconds since 1970 when it was set, and the bytes sent then
+    since: u64,
+    tx: u64,
+    confirmed: bool,
+    // the latest handshake, and the bytes sent then
+    handshake: u64,
+    handshake_tx: u64,
+}
+
+impl KeyUse {
+    fn new(key: conf::Key, since: u64, tx: u64) -> KeyUse {
+        KeyUse { key, since, tx, confirmed: false, handshake: 0, handshake_tx: 0 }
+    }
 }
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -110,16 +136,125 @@ pub struct Switch {
 struct Entry {
     name: String,
     id: store::Id,
+    // as in the configuration file
     config: Config,
-    // of the private key, for the details
-    public_key: String,
+    // the WireGuard keys this computer made for the server
+    keys: OwnKeys,
     active: Option<Active>,
 }
 
 impl Entry {
-    fn new(name: String, id: store::Id, config: Config) -> Entry {
-        let public_key = conf::encode_key(&crate::x25519::public_key(&config.private_key));
-        Entry { name, id, config, public_key, active: None }
+    fn new(name: String, id: store::Id, config: Config, keys: OwnKeys) -> Entry {
+        Entry { name, id, config, keys, active: None }
+    }
+
+    // the private key of the next connection: the one the server takes
+    fn first_key(&self) -> conf::Key {
+        self.keys.own.unwrap_or(self.config.private_key)
+    }
+
+    fn key_in_use(&self) -> conf::Key {
+        self.active.as_ref().map_or_else(|| self.first_key(), |active| active.key.key)
+    }
+
+    // the keys to try, in this order, when the one in use gets no handshake
+    fn candidates(&self) -> Vec<conf::Key> {
+        let mut keys: Vec<conf::Key> = Vec::new();
+        for key in [self.keys.own, Some(self.config.private_key), self.keys.pending].into_iter().flatten() {
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+        keys
+    }
+
+    fn describe(&self, key: &conf::Key) -> &'static str {
+        if *key == self.config.private_key {
+            "the key of the configuration file"
+        } else if Some(*key) == self.keys.own {
+            "the key of this computer"
+        } else {
+            "the new key of this computer"
+        }
+    }
+
+    fn save_keys(&self) -> Result<(), String> {
+        // the tests never write the keys of the tunnels of this computer
+        if cfg!(test) {
+            return Ok(());
+        }
+        store::save_keys(&self.name, &self.keys).map_err(|error| {
+            log!("{}: can't save the keys of this computer: {}", self.name, error);
+            error
+        })
+    }
+
+    // A handshake came with the key in use: the server takes it. A new key becomes the one of this computer; the
+    // key of the file again means a new enrollment on the server, the key of this computer is kept for a while as
+    // pending, in case the server only lost it for some time. A pending key stays: it's the one being given to the
+    // server, or one it may take later.
+    fn confirmed(&mut self, key: conf::Key) {
+        let before = self.keys;
+        if Some(key) == self.keys.pending && Some(key) != self.keys.own {
+            self.keys = OwnKeys { own: Some(key), pending: None };
+            log!("{}: the server takes the key of this computer, the configuration file no longer connects", self.name);
+        } else if key == self.config.private_key && self.keys.own.is_some() {
+            self.keys = OwnKeys { own: None, pending: self.keys.own };
+            log!("{}: the server takes the key of the configuration file again", self.name);
+        }
+        if self.keys != before {
+            let _ = self.save_keys();
+        }
+    }
+
+    // While it's on: no handshake with the key in use, after packets were sent, for KEY_SILENCE seconds, or
+    // KEY_LOST for a key that worked: the next key. The server may take another key of the tunnel: the key of the
+    // file after a new enrollment, or the new key of this computer when its answer was lost.
+    fn watch_key(&mut self, stats: &[PeerStats], now: u64) {
+        let handshake = stats.iter().map(|stats| stats.last_handshake).max().unwrap_or(0);
+        let tx: u64 = stats.iter().map(|stats| stats.tx_bytes).sum();
+        let Some(active) = self.active.as_mut() else { return };
+        let key = &mut active.key;
+        if handshake > key.handshake {
+            key.handshake = handshake;
+            key.handshake_tx = tx;
+        }
+        // in seconds: on a fast network the handshake comes in the second the key was set, and the next one only 2
+        // minutes later. A key is set after the latest handshake of the one before, so the same second is this key
+        if !key.confirmed && handshake != 0 && handshake >= key.since {
+            key.confirmed = true;
+            let confirmed = key.key;
+            self.confirmed(confirmed);
+            return;
+        }
+        let quiet = if key.confirmed {
+            now.saturating_sub(key.handshake) >= KEY_LOST && tx > key.handshake_tx
+        } else {
+            now.saturating_sub(key.since) >= KEY_SILENCE && tx > key.tx
+        };
+        if quiet {
+            self.next_key(now, tx);
+        }
+    }
+
+    fn next_key(&mut self, now: u64, tx: u64) {
+        let candidates = self.candidates();
+        let Some(active) = self.active.as_mut() else { return };
+        let position = candidates.iter().position(|key| *key == active.key.key).map_or(0, |position| position + 1);
+        let next = candidates[position % candidates.len()];
+        match active.tunnel.set_private_key(&next) {
+            Ok(()) => {
+                active.key = KeyUse::new(next, now, tx);
+                log!("{}: no handshake, now with {}", self.name, self.describe(&next));
+            }
+            Err(error) => {
+                // again after another silence
+                active.key.since = now;
+                active.key.tx = tx;
+                active.key.handshake_tx = tx;
+                log!("{}: {}", self.name, error);
+            }
+        }
     }
 }
 
@@ -139,7 +274,10 @@ impl Manager {
         let mut entries = Vec::new();
         for stored in store::list() {
             match conf::parse(&stored.text) {
-                Ok(config) => entries.push(Entry::new(stored.name, stored.id, config)),
+                Ok(config) => {
+                    let keys = store::load_keys(&stored.name);
+                    entries.push(Entry::new(stored.name, stored.id, config, keys))
+                }
                 Err(error) => log!("{}: the configuration isn't valid anymore: {}", stored.name, error),
             }
         }
@@ -164,20 +302,30 @@ impl Manager {
             return Response::success();
         }
         let steps = steps(&entry.config);
-        let started = resolve(&entry.name, &entry.config).and_then(|failovers| {
+        let key = entry.first_key();
+        let mut config = entry.config.clone();
+        config.private_key = key;
+        let started = resolve(&entry.name, &config).and_then(|failovers| {
             let endpoints: Vec<Option<SocketAddr>> =
                 failovers.iter().map(|failover| failover.as_ref().map(Failover::address)).collect();
-            let tunnel = self.engine.start(&entry.name, &entry.id, &entry.config, &endpoints, &steps)?;
-            Ok((tunnel, failovers))
+            // before the start: the first handshake can come while the routes are set
+            let since = unix_now();
+            let tunnel = self.engine.start(&entry.name, &entry.id, &config, &endpoints, &steps)?;
+            Ok((tunnel, failovers, since))
         });
         match started {
-            Ok((tunnel, failovers)) => {
+            Ok((tunnel, failovers, key_since)) => {
                 log!("{}: on, for the session {}", entry.name, session);
                 if steps.dns_after {
                     log!("{}: the routes to the internet and the DNS servers wait for the login", entry.name);
                 }
+                if key != entry.config.private_key {
+                    log!("{}: with {}", entry.name, entry.describe(&key));
+                }
                 let id = next_id();
-                entry.active = Some(Active { tunnel, since: unix_now(), session, id, failovers, logged_in: false });
+                let since = unix_now();
+                let key = KeyUse::new(key, key_since, 0);
+                entry.active = Some(Active { tunnel, since, session, id, failovers, logged_in: false, key });
                 Response::success()
             }
             Err(error) => {
@@ -242,7 +390,8 @@ impl Manager {
                 for ignored in &config.ignored {
                     log!("{}: {} is ignored", name, ignored);
                 }
-                self.entries.push(Entry::new(stored.name, stored.id, config));
+                // the keys made for the old file are gone with it
+                self.entries.push(Entry::new(stored.name, stored.id, config, OwnKeys::default()));
                 self.entries.sort_by_key(|entry| entry.name.to_lowercase());
                 Response::success()
             }
@@ -361,15 +510,21 @@ impl Manager {
         }
     }
 
-    // every POLL: whether the servers of the tunnels that are on still answer
+    // every POLL: whether the servers of the tunnels that are on still answer, and still take their key
     pub fn watch(&mut self, now: Instant) -> Vec<Switch> {
+        let unix = unix_now();
         let mut switches = Vec::new();
         for entry in &mut self.entries {
-            let Some(active) = &mut entry.active else { continue };
-            if active.failovers.iter().all(Option::is_none) {
+            let Some(active) = &entry.active else { continue };
+            let keys = entry.candidates().len() > 1;
+            if !keys && active.failovers.iter().all(Option::is_none) {
                 continue;
             }
             let stats = active.tunnel.peers();
+            if keys {
+                entry.watch_key(&stats, unix);
+            }
+            let Some(active) = &mut entry.active else { continue };
             for (index, failover) in active.failovers.iter_mut().enumerate() {
                 let Some(failover) = failover else { continue };
                 let key = entry.config.peers[index].public_key;
@@ -450,7 +605,68 @@ impl Manager {
                 self.sign(&name, host, &challenge, &username, machine_id)
             }
             Request::DeviceKey { name } => self.device_key(&name),
+            Request::NewWireguardKey { name, host, challenge } => self.new_wireguard_key(&name, host, &challenge),
+            Request::WireguardKey { name, accepted } => self.wireguard_key(&name, accepted),
         }
+    }
+
+    // A WireGuard key for the server of a tunnel that's on, kept pending before the request leaves: if the answer of
+    // the server is lost, the tunnel can still try the key when the one in use stops working
+    fn new_wireguard_key(&mut self, name: &str, host: Ipv4Addr, challenge: &str) -> Response {
+        let Some(entry) = self.find(name) else {
+            return Response::failure(ipc::NOT_FOUND, format!("There's no VPN named {}.", name));
+        };
+        if entry.active.is_none() {
+            return Response::failure(ipc::INVALID, format!("{} isn't connected.", entry.name));
+        }
+        let made = x25519::new_private_key().and_then(|key| {
+            let request = device::wireguard_key(&entry.name, &entry.id, &entry.config, host, challenge, &x25519::public_key(&key))?;
+            Ok((key, request))
+        });
+        let (key, request) = match made {
+            Ok(made) => made,
+            Err(error) => {
+                log!("{}: can't make a key for the server: {}", entry.name, error);
+                return Response::failure(ipc::FAILED, format!("This computer can't make its key: {}.", error));
+            }
+        };
+        let before = entry.keys.pending;
+        entry.keys.pending = Some(key);
+        if let Err(error) = entry.save_keys() {
+            entry.keys.pending = before;
+            return Response::failure(ipc::FAILED, format!("This computer can't keep its key: {}.", error));
+        }
+        log!("{}: made a WireGuard key for the server", entry.name);
+        Response { ok: true, new_key: Some(request), ..Response::default() }
+    }
+
+    // The server took the pending key, and switches to it: the tunnel too, at once. Or it refused it.
+    fn wireguard_key(&mut self, name: &str, accepted: bool) -> Response {
+        let Some(entry) = self.find(name) else {
+            return Response::failure(ipc::NOT_FOUND, format!("There's no VPN named {}.", name));
+        };
+        let Some(key) = entry.keys.pending else {
+            return Response::success();
+        };
+        if !accepted {
+            entry.keys.pending = None;
+            log!("{}: the server refused the key of this computer", entry.name);
+            let _ = entry.save_keys();
+            return Response::success();
+        }
+        entry.keys = OwnKeys { own: Some(key), pending: None };
+        let _ = entry.save_keys();
+        if let Some(active) = entry.active.as_mut() {
+            let tx = active.tunnel.peers().iter().map(|stats| stats.tx_bytes).sum();
+            // before the change: the handshake it starts can come at once
+            let since = unix_now();
+            match active.tunnel.set_private_key(&key) {
+                Ok(()) => active.key = KeyUse::new(key, since, tx),
+                Err(error) => log!("{}: {}", entry.name, error),
+            }
+        }
+        log!("{}: the server takes the key of this computer, the configuration file no longer connects", entry.name);
+        Response::success()
     }
 
     // the ID of the device key of a tunnel: whose it is, not the key
@@ -532,7 +748,9 @@ fn info(entry: &Entry) -> TunnelInfo {
         handshake: peers.iter().map(|peer| peer.handshake).max().unwrap_or(0),
         rx_bytes: peers.iter().map(|peer| peer.rx_bytes).sum(),
         tx_bytes: peers.iter().map(|peer| peer.tx_bytes).sum(),
-        public_key: entry.public_key.clone(),
+        // of the private key in use, or of the next connection
+        public_key: conf::encode_key(&x25519::public_key(&entry.key_in_use())),
+        own_key: entry.key_in_use() != config.private_key,
         device: config.name.clone(),
         listen_port: config.listen_port,
         dns: config.dns.iter().map(ToString::to_string).collect(),
@@ -637,6 +855,11 @@ pub mod fake {
             peer.endpoint = Some(address);
             Ok(())
         }
+
+        // the fake servers answer any key
+        fn set_private_key(&mut self, _key: &conf::Key) -> Result<(), String> {
+            Ok(())
+        }
     }
 
     pub struct FakeEngine;
@@ -681,6 +904,9 @@ mod tests {
         refuse: bool,
         // the routes of after the login, as the manager asked
         after_login: bool,
+        // the private key the manager set, and the latest handshake
+        key: Option<conf::Key>,
+        handshake: u64,
     }
 
     struct ScriptedTunnel(Arc<Mutex<Script>>, conf::Key);
@@ -693,7 +919,7 @@ mod tests {
                 endpoint: script.endpoint,
                 tx_bytes: script.tx,
                 rx_bytes: script.rx,
-                last_handshake: 0,
+                last_handshake: script.handshake,
             }]
         }
 
@@ -712,6 +938,15 @@ mod tests {
                 return Err("can't change the address of the server: refused".into());
             }
             script.endpoint = Some(address);
+            Ok(())
+        }
+
+        fn set_private_key(&mut self, key: &conf::Key) -> Result<(), String> {
+            let mut script = self.0.lock().unwrap();
+            if script.refuse {
+                return Err("can't change the key of the tunnel: refused".into());
+            }
+            script.key = Some(*key);
             Ok(())
         }
 
@@ -752,11 +987,13 @@ mod tests {
         let endpoint = failovers[0].as_ref().map(Failover::address);
         let script = Arc::new(Mutex::new(Script { endpoint, ..Script::default() }));
         let tunnel = ScriptedTunnel(script.clone(), config.peers[0].public_key);
+        let key = KeyUse::new(config.private_key, unix_now(), 0);
         // a GUID on Windows, nothing on macOS
         #[allow(clippy::default_constructed_unit_structs)]
-        let mut entry = Entry::new("Office".into(), store::Id::default(), config);
+        let mut entry = Entry::new("Office".into(), store::Id::default(), config, OwnKeys::default());
         let tunnel: Box<dyn Tunnel> = Box::new(tunnel);
-        entry.active = Some(Active { tunnel, since: unix_now(), session: 1, id: next_id(), failovers, logged_in: false });
+        let since = unix_now();
+        entry.active = Some(Active { tunnel, since, session: 1, id: next_id(), failovers, logged_in: false, key });
         let manager = Manager { entries: vec![entry], engine: Box::new(NoEngine) };
         (manager, script)
     }
@@ -847,7 +1084,7 @@ mod tests {
         let (mut manager, _) = office();
         let config = conf::parse(CONFIG).unwrap();
         #[allow(clippy::default_constructed_unit_structs)]
-        manager.entries.push(Entry::new("Home".into(), store::Id::default(), config));
+        manager.entries.push(Entry::new("Home".into(), store::Id::default(), config, OwnKeys::default()));
         let admin = Client { session: 1, can_manage: true };
         let rename = |manager: &mut Manager, name: &str, new_name: &str, client: &Client| {
             manager.handle(Request::Rename { name: name.into(), new_name: new_name.into() }, client)
@@ -920,6 +1157,137 @@ mod tests {
         assert!(!manager.list()[0].logged_in);
         manager.down("Office");
         assert_eq!(logged_in(&mut manager, true).error_code(), ipc::INVALID);
+    }
+
+    // Office with the keys of this computer, on with the first one since 1000, as up() leaves it
+    fn office_with(keys: OwnKeys) -> (Manager, Arc<Mutex<Script>>) {
+        let (mut manager, script) = office();
+        let entry = &mut manager.entries[0];
+        entry.keys = keys;
+        let first = entry.first_key();
+        entry.active.as_mut().unwrap().key = KeyUse::new(first, 1000, 0);
+        (manager, script)
+    }
+
+    // the bytes sent and the latest handshake at this second, then the watch of the key
+    fn watch_key(manager: &mut Manager, script: &Mutex<Script>, now: u64, tx: u64, handshake: u64) {
+        {
+            let mut script = script.lock().unwrap();
+            script.tx = tx;
+            script.handshake = handshake;
+        }
+        let stats = manager.entries[0].active.as_ref().unwrap().tunnel.peers();
+        manager.entries[0].watch_key(&stats, now);
+    }
+
+    const NEW_KEY: conf::Key = [9; 32];
+
+    #[test]
+    fn a_new_key_the_server_takes() {
+        let file = conf::parse(CONFIG).unwrap().private_key;
+        // the answer of the server was lost: the key of the file stops working
+        let (mut manager, script) = office_with(OwnKeys { own: None, pending: Some(NEW_KEY) });
+        assert_eq!(manager.entries[0].candidates(), [file, NEW_KEY]);
+        watch_key(&mut manager, &script, 1010, 148, 0);
+        assert_eq!(script.lock().unwrap().key, None);
+        // packets for KEY_SILENCE seconds and no handshake: the new key
+        watch_key(&mut manager, &script, 1000 + KEY_SILENCE, 296, 0);
+        assert_eq!(script.lock().unwrap().key, Some(NEW_KEY));
+        // a handshake with it: the server took it, it's the key of this computer now
+        watch_key(&mut manager, &script, 1031, 400, 1031);
+        assert_eq!(manager.entries[0].keys, OwnKeys { own: Some(NEW_KEY), pending: None });
+        let info = &manager.list()[0];
+        assert!(info.own_key);
+        assert_eq!(info.public_key, conf::encode_key(&x25519::public_key(&NEW_KEY)));
+        // no packets: nothing to say, however long
+        script.lock().unwrap().key = None;
+        watch_key(&mut manager, &script, 1031 + KEY_LOST * 3, 400, 1031);
+        assert_eq!(script.lock().unwrap().key, None);
+        // the next connection starts with it
+        assert_eq!(manager.entries[0].first_key(), NEW_KEY);
+    }
+
+    #[test]
+    fn the_key_of_the_file_again() {
+        let file = conf::parse(CONFIG).unwrap().private_key;
+        let (mut manager, script) = office_with(OwnKeys { own: Some(NEW_KEY), pending: None });
+        watch_key(&mut manager, &script, 1001, 148, 1001);
+        assert_eq!(manager.entries[0].keys.own, Some(NEW_KEY));
+        // the handshakes stop, while packets go: a new enrollment on the server
+        watch_key(&mut manager, &script, 1100, 5000, 1001);
+        assert_eq!(script.lock().unwrap().key, None);
+        watch_key(&mut manager, &script, 1001 + KEY_LOST, 10000, 1001);
+        assert_eq!(script.lock().unwrap().key, Some(file));
+        watch_key(&mut manager, &script, 1204, 10100, 1203);
+        // the key of this computer is kept a while, the next connection starts with the key of the file
+        assert_eq!(manager.entries[0].keys, OwnKeys { own: None, pending: Some(NEW_KEY) });
+        assert_eq!(manager.entries[0].first_key(), file);
+        assert!(!manager.list()[0].own_key);
+        // the key of the file works at once at the next connection: the pending key stays, it may be the one
+        // being given to the server right now
+        let (mut manager, script) = office_with(OwnKeys { own: None, pending: Some(NEW_KEY) });
+        watch_key(&mut manager, &script, 1001, 148, 1001);
+        assert_eq!(manager.entries[0].keys, OwnKeys { own: None, pending: Some(NEW_KEY) });
+    }
+
+    #[test]
+    fn a_handshake_in_the_second_the_key_was_set() {
+        // on a fast network: the server takes the key, and the next handshake comes only 2 minutes later
+        let (mut manager, script) = office_with(OwnKeys { own: Some(NEW_KEY), pending: None });
+        watch_key(&mut manager, &script, 1000, 148, 1000);
+        watch_key(&mut manager, &script, 1000 + KEY_SILENCE, 5000, 1000);
+        assert_eq!(script.lock().unwrap().key, None);
+        // the same after a change of key
+        let (mut manager, script) = office_with(OwnKeys { own: None, pending: Some(NEW_KEY) });
+        watch_key(&mut manager, &script, 1000 + KEY_SILENCE, 296, 0);
+        assert_eq!(script.lock().unwrap().key, Some(NEW_KEY));
+        watch_key(&mut manager, &script, 1000 + KEY_SILENCE, 400, 1000 + KEY_SILENCE);
+        assert_eq!(manager.entries[0].keys, OwnKeys { own: Some(NEW_KEY), pending: None });
+        script.lock().unwrap().key = None;
+        watch_key(&mut manager, &script, 1000 + 2 * KEY_SILENCE, 5000, 1000 + KEY_SILENCE);
+        assert_eq!(script.lock().unwrap().key, None);
+    }
+
+    #[test]
+    fn a_tunnel_that_refuses_the_key() {
+        let (mut manager, script) = office_with(OwnKeys { own: None, pending: Some(NEW_KEY) });
+        script.lock().unwrap().refuse = true;
+        watch_key(&mut manager, &script, 1000 + KEY_SILENCE, 296, 0);
+        assert_eq!(script.lock().unwrap().key, None);
+        // again after another silence
+        script.lock().unwrap().refuse = false;
+        watch_key(&mut manager, &script, 1000 + KEY_SILENCE + 10, 400, 0);
+        assert_eq!(script.lock().unwrap().key, None);
+        watch_key(&mut manager, &script, 1000 + 2 * KEY_SILENCE, 500, 0);
+        assert_eq!(script.lock().unwrap().key, Some(NEW_KEY));
+    }
+
+    #[test]
+    fn what_the_server_said_of_the_key() {
+        let user = Client { session: 1, can_manage: false };
+        let answer = |manager: &mut Manager, accepted: bool| {
+            manager.handle(Request::WireguardKey { name: "Office".into(), accepted }, &user)
+        };
+        // refused: forgotten
+        let (mut manager, script) = office_with(OwnKeys { own: None, pending: Some(NEW_KEY) });
+        assert!(answer(&mut manager, false).ok);
+        assert!(manager.entries[0].keys.is_empty() && script.lock().unwrap().key.is_none());
+        // taken: the key of this computer, at once in the tunnel
+        manager.entries[0].keys.pending = Some(NEW_KEY);
+        assert!(answer(&mut manager, true).ok);
+        assert_eq!(manager.entries[0].keys, OwnKeys { own: Some(NEW_KEY), pending: None });
+        assert_eq!(script.lock().unwrap().key, Some(NEW_KEY));
+        assert_eq!(manager.entries[0].key_in_use(), NEW_KEY);
+        // nothing pending: nothing changes
+        assert!(answer(&mut manager, true).ok);
+        assert_eq!(manager.entries[0].keys.own, Some(NEW_KEY));
+        let missing = manager.handle(Request::WireguardKey { name: "Nowhere".into(), accepted: true }, &user);
+        assert_eq!(missing.error_code(), ipc::NOT_FOUND);
+        // off: no new key
+        manager.down("Office");
+        let host = "10.103.1.1".parse().unwrap();
+        let request = Request::NewWireguardKey { name: "Office".into(), host, challenge: "C".into() };
+        assert_eq!(manager.handle(request, &user).error_code(), ipc::INVALID);
     }
 
     #[test]

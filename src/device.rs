@@ -11,6 +11,8 @@ use crate::conf::{self, Config};
 use crate::{devkey, digest, store, x25519};
 
 pub const MESSAGE: &str = "ns-wgauth-device-v1";
+// signed to give the peer a WireGuard key of this computer, see wireguard_key
+pub const WIREGUARD_KEY_MESSAGE: &str = "ns-wgauth-wireguard-key-v1";
 // DER SubjectPublicKeyInfo of a P-256 key, before its 65 bytes uncompressed point
 const SPKI_PREFIX: [u8; 26] = [
     0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce,
@@ -36,6 +38,16 @@ pub struct Proof {
     pub machine_id: String,
 }
 
+// The request that gives the peer a WireGuard key that this computer made: POST /api/device-key
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct NewKey {
+    pub challenge: String,
+    // the public key, base64
+    pub wireguard_key: String,
+    // DER, base64
+    pub signature: String,
+}
+
 // What the device signs: one challenge, one server, one peer, one user name
 pub fn message(
     challenge: &str,
@@ -46,6 +58,11 @@ pub fn message(
     machine_id: &str,
 ) -> Vec<u8> {
     [MESSAGE, challenge, server_key, peer_key, address, username, machine_id].join("\n").into_bytes()
+}
+
+// What the device signs to give the peer a new WireGuard key: one challenge, one server, one peer, one key
+pub fn key_message(challenge: &str, server_key: &str, peer_key: &str, address: &str, new_key: &str) -> Vec<u8> {
+    [WIREGUARD_KEY_MESSAGE, challenge, server_key, peer_key, address, new_key].join("\n").into_bytes()
 }
 
 pub fn spki(point: &[u8; 65]) -> Vec<u8> {
@@ -103,6 +120,20 @@ fn server_of(config: &Config, host: Ipv4Addr) -> Option<&conf::Peer> {
     config.peers.iter().find(routes).or(config.peers.first())
 }
 
+// The server of the login page and the address of the peer in the VPN, as the messages name them
+fn identity(config: &Config, host: Ipv4Addr) -> Result<(&conf::Peer, Ipv4Addr), String> {
+    let server = server_of(config, host).ok_or("the configuration has no server")?;
+    let address = config
+        .addresses
+        .iter()
+        .find_map(|net| match net.addr {
+            IpAddr::V4(address) => Some(address),
+            IpAddr::V6(_) => None,
+        })
+        .ok_or("the configuration has no IPv4 address")?;
+    Ok((server, address))
+}
+
 // The proof of a login on the page at `host`, signed by the key of the tunnel, made when it's missing
 pub fn prove(
     tunnel: &str,
@@ -116,15 +147,7 @@ pub fn prove(
     if !is_field(challenge, MAX_CHALLENGE) || !is_field(username, MAX_USERNAME) {
         return Err("not a challenge of a login page".into());
     }
-    let server = server_of(config, host).ok_or("the configuration has no server")?;
-    let address = config
-        .addresses
-        .iter()
-        .find_map(|net| match net.addr {
-            IpAddr::V4(address) => Some(address),
-            IpAddr::V6(_) => None,
-        })
-        .ok_or("the configuration has no IPv4 address")?;
+    let (server, address) = identity(config, host)?;
     let machine = if machine_id {
         let raw = devkey::machine_id().ok_or("the ID of this computer can't be read")?;
         machine_hmac(&server.public_key, &raw)
@@ -146,6 +169,28 @@ pub fn prove(
     })
 }
 
+// The request that gives the peer the WireGuard key `new_key`, made by this computer, signed by the device key of the
+// tunnel: once the server takes it, the configuration file no longer connects. `config` is the one of the file: the
+// message names the peer by the key of its file.
+pub fn wireguard_key(
+    tunnel: &str,
+    id: &store::Id,
+    config: &Config,
+    host: Ipv4Addr,
+    challenge: &str,
+    new_key: &conf::Key,
+) -> Result<NewKey, String> {
+    if !is_field(challenge, MAX_CHALLENGE) {
+        return Err("not a challenge of a login page".into());
+    }
+    let (server, address) = identity(config, host)?;
+    let peer_key = conf::encode_key(&x25519::public_key(&config.private_key));
+    let new_key = conf::encode_key(new_key);
+    let data = key_message(challenge, &conf::encode_key(&server.public_key), &peer_key, &address.to_string(), &new_key);
+    let signature = devkey::sign(tunnel, id, &data)?;
+    Ok(NewKey { challenge: challenge.to_string(), wireguard_key: new_key, signature: conf::base64(&signature) })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,6 +201,9 @@ mod tests {
         let expected = format!("ns-wgauth-device-v1\nCHALLENGE\nSERVER\nPEER\n10.103.1.2\nAlice\n{}", "ab".repeat(32));
         assert_eq!(data, expected.as_bytes());
         assert!(message("C", "S", "P", "10.103.1.2", "alice", "").ends_with(b"\nalice\n"));
+        // the same as nethsec.wgauth.wireguard_key_message on the firewall
+        let data = key_message("CHALLENGE", "SERVER", "PEER", "10.103.1.2", "NEW");
+        assert_eq!(data, b"ns-wgauth-wireguard-key-v1\nCHALLENGE\nSERVER\nPEER\n10.103.1.2\nNEW");
         assert!(is_field("alice", 10) && !is_field("", 10) && !is_field("a\nb", 10) && !is_field(&"a".repeat(11), 10));
     }
 

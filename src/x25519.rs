@@ -1,6 +1,6 @@
-// X25519 of RFC 7748, only to show the public key of a configuration: the service has the private key, the window
-// of details shows the public one, which the administrator of the server knows. The ladder is the constant-time
-// one of the RFC, on numbers of five limbs of 51 bits.
+// X25519 of RFC 7748, for the public keys only: of a configuration, which the window of details shows and the
+// administrator of the server knows, and of the keys the service makes for the servers with device binding. The
+// ladder is the constant-time one of the RFC, on numbers of five limbs of 51 bits.
 
 use crate::conf::Key;
 
@@ -165,6 +165,36 @@ pub fn public_key(private_key: &Key) -> Key {
     x25519(private_key, &base)
 }
 
+// A new private key, as `wg genkey` makes it: random bytes from the system, clamped
+pub fn new_private_key() -> Result<Key, String> {
+    let mut key = random_bytes()?;
+    key[0] &= 248;
+    key[31] &= 127;
+    key[31] |= 64;
+    Ok(key)
+}
+
+#[cfg(windows)]
+fn random_bytes() -> Result<Key, String> {
+    use windows_sys::Win32::Security::Cryptography::{BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG};
+    let mut key = [0u8; 32];
+    let status = unsafe { BCryptGenRandom(std::ptr::null_mut(), key.as_mut_ptr(), 32, BCRYPT_USE_SYSTEM_PREFERRED_RNG) };
+    if status != 0 {
+        return Err(format!("no random bytes from the system: 0x{:08x}", status as u32));
+    }
+    Ok(key)
+}
+
+#[cfg(not(windows))]
+fn random_bytes() -> Result<Key, String> {
+    use std::io::Read;
+    let mut key = [0u8; 32];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut file| file.read_exact(&mut key))
+        .map_err(|error| format!("no random bytes from the system: {}", error))?;
+    Ok(key)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,6 +224,16 @@ mod tests {
         let shared = key("4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742");
         assert_eq!(x25519(&alice, &public_key(&bob)), shared);
         assert_eq!(x25519(&bob, &public_key(&alice)), shared);
+    }
+
+    #[test]
+    fn new_keys() {
+        let first = new_private_key().unwrap();
+        let second = new_private_key().unwrap();
+        assert_ne!(first, second);
+        // clamped as WireGuard wants it
+        assert_eq!((first[0] & 7, first[31] & 0xc0), (0, 0x40));
+        assert_ne!(public_key(&first), public_key(&second));
     }
 
     // after 1000 rounds of k, u = X25519(k, u), k

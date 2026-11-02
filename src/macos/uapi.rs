@@ -54,6 +54,12 @@ pub fn set_config(config: &Config, endpoints: &[Option<SocketAddr>]) -> String {
     text + "\n"
 }
 
+// Another private key: the peers stay, wireguard-go forgets their sessions and makes new handshakes. The text holds
+// the private key: the caller wipes it once sent.
+pub fn set_private_key(key: &Key) -> String {
+    format!("set=1\nprivate_key={}\n\n", hex(key))
+}
+
 // Another address for a server: the rest stays as it is, its session included
 pub fn set_endpoint(public_key: &Key, endpoint: &SocketAddr) -> String {
     format!("set=1\npublic_key={}\nupdate_only=true\nendpoint={}\n\n", hex(public_key), endpoint)
@@ -138,6 +144,14 @@ mod tests {
             format!("set=1\npublic_key={}\nupdate_only=true\nendpoint=203.0.113.2:51821\n\n", hex(&key))
         );
         assert!(!text.contains("private_key") && !text.contains("replace"));
+    }
+
+    #[test]
+    fn another_private_key() {
+        let text = set_private_key(&[0xab; 32]);
+        assert_eq!(text, format!("set=1\nprivate_key={}\n\n", "ab".repeat(32)));
+        // the peers stay
+        assert!(!text.contains("public_key") && !text.contains("replace"));
     }
 
     #[test]

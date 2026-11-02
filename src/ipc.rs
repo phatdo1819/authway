@@ -58,6 +58,11 @@ pub enum Request {
     },
     // the ID of the device key of a tunnel, for the status of the login page, see device.rs
     DeviceKey { name: String },
+    // a new WireGuard key for a tunnel that's on, kept pending, and the request that gives it to the peer, signed by
+    // the device key, for the login page at `host`: see device::wireguard_key
+    NewWireguardKey { name: String, host: std::net::Ipv4Addr, challenge: String },
+    // what the server said of the pending key: taken, and used at once, or refused, and forgotten
+    WireguardKey { name: String, accepted: bool },
 }
 
 // the errors of the service
@@ -83,6 +88,9 @@ pub struct Response {
     // the answer to DeviceKey: empty when the tunnel has no key yet
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_key: Option<String>,
+    // the answer to NewWireguardKey
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_key: Option<crate::device::NewKey>,
     // whether the user who asked can add and remove tunnels without asking to be administrator
     #[serde(default)]
     pub can_manage: bool,
@@ -145,6 +153,9 @@ pub struct TunnelInfo {
     // the rest of the configuration, for the window of details: never a private or preshared key
     #[serde(default)]
     pub public_key: String,
+    // the public key is of a key this computer made, not of the configuration file: see conf::OwnKeys
+    #[serde(default)]
+    pub own_key: bool,
     // "# Name = ..." of the interface: the name of this device on the server
     #[serde(default)]
     pub device: Option<String>,

@@ -1,12 +1,14 @@
 // The window that connects a VPN whose server requires a login: username, password and the code of the
-// authenticator app. It opens as the tunnel comes up, so the user types while it connects.
+// authenticator app. It opens as the tunnel comes up, with a progress bar until the login page says what it asks, then
+// with the fields it asks.
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{sel, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSBackingStoreType, NSButton, NSColor, NSControlStateValueOff, NSControlStateValueOn, NSFont, NSResponder,
-    NSSecureTextField, NSTextField, NSView, NSWindow, NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSBackingStoreType, NSButton, NSColor, NSControlStateValueOff, NSControlStateValueOn, NSFont, NSProgressIndicator,
+    NSProgressIndicatorStyle, NSResponder, NSSecureTextField, NSTextField, NSView, NSWindow, NSWindowCollectionBehavior,
+    NSWindowStyleMask,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 
@@ -21,6 +23,7 @@ const GAP: f64 = 10.0;
 const FIELD_HEIGHT: f64 = 22.0;
 const CODE_HEIGHT: f64 = 28.0;
 const BUTTON_HEIGHT: f64 = 32.0;
+const PROGRESS_HEIGHT: f64 = 12.0;
 
 pub struct LoginWindow {
     mtm: MainThreadMarker,
@@ -35,10 +38,12 @@ pub struct LoginWindow {
     remember: Retained<NSButton>,
     code_label: Retained<NSTextField>,
     code: Retained<NSTextField>,
+    progress: Retained<NSProgressIndicator>,
     error: Retained<NSTextField>,
     ok: Retained<NSButton>,
     cancel: Retained<NSButton>,
     otp_required: bool,
+    checking: bool,
     can_remember: bool,
     busy: bool,
 }
@@ -108,6 +113,10 @@ impl LoginWindow {
         ok.setKeyEquivalent(&ns("\r"));
         let cancel = button(strings::CANCEL, sel!(cancelPressed:));
         cancel.setKeyEquivalent(&ns("\u{1b}"));
+        let progress = NSProgressIndicator::new(mtm);
+        progress.setStyle(NSProgressIndicatorStyle::Bar);
+        progress.setIndeterminate(true);
+        progress.setDisplayedWhenStopped(false);
 
         let mut login = LoginWindow {
             mtm,
@@ -122,10 +131,12 @@ impl LoginWindow {
             remember,
             code_label: label(strings::LOGIN_OTP),
             code,
+            progress,
             error,
             ok,
             cancel,
             otp_required: form.otp_required,
+            checking: form.checking,
             can_remember: form.can_remember,
             busy: false,
         };
@@ -140,7 +151,6 @@ impl LoginWindow {
         // checked the first time, then as the user left it
         let checked = form.can_remember && (form.saved.password.is_some() || form.saved.username.is_empty());
         login.remember.setState(if checked { NSControlStateValueOn } else { NSControlStateValueOff });
-        login.remember.setHidden(!form.can_remember);
         login.set_notice(form.notice);
         login.layout();
         login.window.setAutorecalculatesKeyViewLoop(true);
@@ -151,7 +161,7 @@ impl LoginWindow {
         Some(login)
     }
 
-    fn views(&self) -> [&NSView; 13] {
+    fn views(&self) -> [&NSView; 14] {
         [
             &self.heading,
             &self.hint,
@@ -163,6 +173,7 @@ impl LoginWindow {
             &self.remember,
             &self.code_label,
             &self.code,
+            &self.progress,
             &self.error,
             &self.ok,
             &self.cancel,
@@ -191,25 +202,42 @@ impl LoginWindow {
             self.notice.setFrame(rect(MARGIN, y, WIDTH, height));
             y += height + 12.0;
         }
+        let shown = !self.checking;
         let fields: [(&NSTextField, &NSView); 2] =
             [(&self.username_label, &self.username), (&self.password_label, &self.password)];
         for (label, field) in fields {
-            label.setFrame(rect(MARGIN, y + (FIELD_HEIGHT - line) / 2.0, label_width, line));
-            field.setFrame(rect(field_x, y, field_width, FIELD_HEIGHT));
-            y += FIELD_HEIGHT + GAP;
+            label.setHidden(!shown);
+            field.setHidden(!shown);
+            if shown {
+                label.setFrame(rect(MARGIN, y + (FIELD_HEIGHT - line) / 2.0, label_width, line));
+                field.setFrame(rect(field_x, y, field_width, FIELD_HEIGHT));
+                y += FIELD_HEIGHT + GAP;
+            }
         }
-        if self.can_remember {
+        self.ok.setHidden(!shown);
+        self.remember.setHidden(!(shown && self.can_remember));
+        if shown && self.can_remember {
             self.remember.setFrame(rect(field_x - 2.0, y - 2.0, field_width, 20.0));
             y += 20.0 + GAP;
         }
-        self.code_label.setHidden(!self.otp_required);
-        self.code.setHidden(!self.otp_required);
-        if self.otp_required {
+        let code = shown && self.otp_required;
+        self.code_label.setHidden(!code);
+        self.code.setHidden(!code);
+        if code {
             self.code_label.setFrame(rect(MARGIN, y + (CODE_HEIGHT - line) / 2.0, label_width, line));
             self.code.setFrame(rect(field_x, y, 120.0, CODE_HEIGHT));
             y += CODE_HEIGHT + GAP;
         }
         let has_error = self.error.stringValue().length() > 0;
+        // while it checks, until something goes wrong
+        let progress = self.checking && !has_error;
+        if progress {
+            self.progress.setFrame(rect(MARGIN, y, WIDTH, PROGRESS_HEIGHT));
+            y += PROGRESS_HEIGHT + GAP;
+            unsafe { self.progress.startAnimation(None) };
+        } else {
+            unsafe { self.progress.stopAnimation(None) };
+        }
         self.error.setHidden(!has_error);
         if has_error {
             let height = text_height(&self.error, WIDTH);
@@ -234,6 +262,11 @@ impl LoginWindow {
     }
 
     fn focus_first_empty(&self) {
+        // nothing to type yet
+        if self.checking {
+            self.window.makeFirstResponder(None);
+            return;
+        }
         let values = self.values();
         if values.username.is_empty() {
             focus(&self.window, &self.username);
@@ -280,6 +313,16 @@ impl LoginView for LoginWindow {
         if self.otp_required != required {
             self.otp_required = required;
             self.layout();
+        }
+    }
+
+    fn set_checking(&mut self, checking: bool) {
+        if self.checking != checking {
+            self.checking = checking;
+            self.layout();
+            if !checking {
+                self.focus_first_empty();
+            }
         }
     }
 

@@ -39,6 +39,8 @@ const UNREACHABLE_ROUTES: Duration = Duration::from_secs(30);
 const NO_HANDSHAKE: u64 = 15;
 const OLD_HANDSHAKE: u64 = 300;
 const LOGOUT_TIMEOUT: Duration = Duration::from_secs(3);
+// the server takes the key a second after its answer: the tunnel switches just after it
+const KEY_SWITCH_WAIT: Duration = Duration::from_millis(1500);
 pub const OTP_LENGTH: usize = 6;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -75,6 +77,10 @@ pub struct Tunnel {
     pub otp_known: bool,
     // device binding: the next login enrolls this computer
     pub enrolling: bool,
+    // the server requires device binding
+    pub binding: bool,
+    // this connection asked the server to take a WireGuard key of this computer, see give_key
+    pub key_asked: bool,
     pub user: String,
     pub expires: u64,
     pub next_check: Instant,
@@ -112,6 +118,8 @@ impl Tunnel {
             otp_required: true,
             otp_known: false,
             enrolling: false,
+            binding: false,
+            key_asked: false,
             user: String::new(),
             expires: 0,
             next_check: now,
@@ -185,6 +193,7 @@ impl Tunnel {
         self.error = None;
         self.up_at = Some(now);
         self.unreachable_since = None;
+        self.key_asked = false;
     }
 
     fn set_off(&mut self) {
@@ -229,6 +238,15 @@ impl Tunnel {
         self.info.up
             && ((self.info.handshake == 0 && now.saturating_sub(self.info.since) > NO_HANDSHAKE)
                 || (self.info.handshake > 0 && now.saturating_sub(self.info.handshake) > OLD_HANDSHAKE))
+    }
+
+    // what to do when the server doesn't answer: with a login, it may be enrolled on another device
+    pub fn no_answer_text(&self) -> &'static str {
+        if self.page.is_some() || self.info.login.is_some() {
+            strings::ERROR_NO_ANSWER_LOGIN
+        } else {
+            strings::ERROR_NO_ANSWER
+        }
     }
 
     pub fn describe(&self) -> String {
@@ -364,6 +382,31 @@ fn log_in(tunnel: &str, page: &Page, interface: u32, username: &str, password: &
     result
 }
 
+// Gives the peer a WireGuard key of this computer, made and kept by the service, with the challenge of a status: once
+// the server takes it, the configuration file of the tunnel, and every copy of it, no longer connects. Without an
+// answer the service keeps the key, and tries it when the one in use gets no handshake.
+fn give_key(tunnel: &str, page: &Page, interface: u32, challenge: String) -> Result<(), String> {
+    let request = Request::NewWireguardKey { name: tunnel.to_string(), host: page.host, challenge };
+    let new_key = match ipc::call(&request) {
+        Ok(response) if response.ok => response.new_key.ok_or("no key")?,
+        Ok(response) => return Err(response.message().to_string()),
+        Err(error) => return Err(call_message(&error)),
+    };
+    let result = api::device_key(page, interface, &new_key);
+    if !result.reached() {
+        return Err(format!("no answer from the login page: {}", result));
+    }
+    let accepted = result.status == 200;
+    if accepted {
+        thread::sleep(KEY_SWITCH_WAIT);
+    }
+    let told = ipc::call(&Request::WireguardKey { name: tunnel.to_string(), accepted });
+    if !accepted {
+        return Err(format!("refused: {}", result));
+    }
+    outcome(&told)
+}
+
 pub enum Event {
     List { requested: Instant, result: Result<Response, CallError> },
     Up { name: String, result: Result<Response, CallError> },
@@ -372,6 +415,7 @@ pub enum Event {
     Login { name: String, generation: u32, result: ApiResult, username: String, password: String, remember: bool },
     Found { name: String, generation: u32, page: Option<Page> },
     LoggedIn { name: String, logged_in: bool, result: Result<Response, CallError> },
+    OwnKey { name: String, result: Result<(), String> },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -448,6 +492,8 @@ pub struct LoginForm<'a> {
     pub can_remember: bool,
     pub otp_required: bool,
     pub notice: Option<&'a str>,
+    // the login page hasn't said yet what it asks: no fields, only the connection and Cancel
+    pub checking: bool,
 }
 
 // The login window of a tunnel: it closes when dropped. Cancel, or closing it, disconnects.
@@ -457,6 +503,8 @@ pub trait LoginView {
     fn set_notice(&mut self, text: Option<&str>);
     fn set_error(&mut self, text: Option<&str>);
     fn set_otp_required(&mut self, required: bool);
+    // false once the login page said what it asks: the fields appear, without the code if it asks none
+    fn set_checking(&mut self, checking: bool);
     fn set_busy(&mut self, busy: bool);
     fn values(&self) -> LoginValues;
     // after a refused login: a code is good once
@@ -504,6 +552,8 @@ struct LoginWindow<V> {
     tunnel: String,
     // Connect was pressed before the login page answered: the login goes as soon as it does
     pending_submit: bool,
+    // opened before the login page said what it asks, and it hasn't yet: the window has no fields
+    checking: bool,
     view: V,
 }
 
@@ -697,6 +747,11 @@ impl<S: Shell> App<S> {
                 }
                 Event::Found { name, generation, page } => self.on_found(&name, generation, page),
                 Event::LoggedIn { name, logged_in, result } => self.on_logged_in(&name, logged_in, result),
+                Event::OwnKey { name, result } => match result {
+                    Ok(()) => log!("{}: the server takes the key of this computer", name),
+                    // again at the next connection
+                    Err(error) => log!("{}: the server didn't take the key of this computer: {}", name, error),
+                },
             }
         }
         if !self.exiting {
@@ -977,6 +1032,7 @@ impl<S: Shell> App<S> {
         let mut close_window = false;
         let mut prompt: Option<Option<&'static str>> = None;
         let mut balloon: Option<(String, bool)> = None;
+        let mut give: Option<(Page, u32, String)> = None;
         {
             let tunnel = &mut self.tunnels[index];
             let previous = tunnel.session;
@@ -1011,6 +1067,8 @@ impl<S: Shell> App<S> {
                 tunnel.otp_known = true;
                 let (not_enrolled, enrolling) = device_state(&result);
                 tunnel.enrolling = enrolling;
+                let challenge = api::device_challenge(&result);
+                tunnel.binding = challenge.is_some();
                 let refused = ["blocked", "no_user", "no_otp"]
                     .into_iter()
                     .find(|key| result.get_bool(key))
@@ -1018,6 +1076,13 @@ impl<S: Shell> App<S> {
                 if result.get_bool("authenticated") {
                     set_logged_in(tunnel, result.get_str("user"), result.get_str("expires"), now);
                     close_window = true;
+                    // once per connection: the server still has the key of the configuration file
+                    if let (true, false, Some(page), Some((challenge, _))) =
+                        (api::wants_own_key(&result), tunnel.key_asked, tunnel.page, challenge)
+                    {
+                        tunnel.key_asked = true;
+                        give = Some((page, tunnel.info.interface, challenge));
+                    }
                     if !tunnel.announced {
                         tunnel.announced = true;
                         let until = time::format_local(tunnel.expires);
@@ -1064,13 +1129,17 @@ impl<S: Shell> App<S> {
                     if tunnel.enrolling {
                         window.view.set_notice(Some(strings::NOTICE_ENROLL));
                     }
+                    if window.checking {
+                        window.checking = false;
+                        window.view.set_checking(false);
+                    }
                     if window.pending_submit {
                         submit = true;
                     } else {
                         window.view.set_error(None);
                     }
                 }
-                Session::Unreachable if tunnel.no_answer() => window.view.set_error(Some(strings::ERROR_NO_ANSWER)),
+                Session::Unreachable if tunnel.no_answer() => window.view.set_error(Some(tunnel.no_answer_text())),
                 session => {
                     if let Some(text) = refusal_text(session) {
                         window.view.set_error(Some(text));
@@ -1089,6 +1158,11 @@ impl<S: Shell> App<S> {
         }
         if submit {
             self.submit_tunnel(&name);
+        }
+        if let Some((page, interface, challenge)) = give {
+            log!("{}: asking the server to take a key of this computer", name);
+            let tunnel = name.clone();
+            self.spawn(move || Event::OwnKey { result: give_key(&tunnel, &page, interface, challenge), name: tunnel });
         }
         self.sync_routes(&name);
     }
@@ -1170,6 +1244,10 @@ impl<S: Shell> App<S> {
         let has_page = tunnel.page.is_some();
         if tunnel.connecting_since.is_none() {
             self.start_up(index);
+            // a new try: what the window said of the one before goes
+            if let Some(window) = self.window_index(name).filter(|&window| self.windows[window].checking) {
+                self.windows[window].view.set_error(None);
+            }
         }
         if has_page {
             self.show_login(name, None);
@@ -1262,7 +1340,8 @@ impl<S: Shell> App<S> {
         let tunnel = &self.tunnels[index];
         let Some(page) = tunnel.page else { return };
         let saved = creds::read(&page);
-        let hint = if tunnel.needs_login() {
+        let checking = !tunnel.needs_login();
+        let hint = if !checking {
             if tunnel.otp_required { strings::LOGIN_HINT_OTP.to_string() } else { strings::LOGIN_HINT.to_string() }
         } else {
             strings::login_connecting(&tunnel.endpoint_host())
@@ -1277,10 +1356,11 @@ impl<S: Shell> App<S> {
             can_remember: settings::can_remember_password(),
             otp_required: tunnel.otp_required,
             notice: notice.or(tunnel.enrolling.then_some(strings::NOTICE_ENROLL)),
+            checking,
         };
         if let Some(mut view) = self.shell.open_login(form) {
             view.set_error(refused);
-            self.windows.push(LoginWindow { tunnel: name.to_string(), pending_submit: false, view });
+            self.windows.push(LoginWindow { tunnel: name.to_string(), pending_submit: false, checking, view });
         }
     }
 
@@ -1304,6 +1384,10 @@ impl<S: Shell> App<S> {
 
     fn submit_tunnel(&mut self, name: &str) {
         let (Some(window), Some(index)) = (self.window_index(name), self.tunnel_index(name)) else { return };
+        // Enter while the window has no fields yet
+        if self.windows[window].checking {
+            return;
+        }
         let values = self.windows[window].view.values();
         let tunnel = &self.tunnels[index];
         let ready = tunnel.needs_login();
@@ -1358,6 +1442,10 @@ impl<S: Shell> App<S> {
             }
             if generation == tunnel.generation && tunnel.info.up {
                 set_logged_in(tunnel, result.get_str("user"), result.get_str("expires"), now);
+                if tunnel.binding && !tunnel.key_asked {
+                    // the status says at once whether the server can take a key of this computer
+                    tunnel.next_check = now;
+                }
                 tunnel.announced = true;
                 let until = time::format_local(tunnel.expires);
                 let text = strings::notice_logged_in(&tunnel.title(), &tunnel.user, &until);
@@ -1655,6 +1743,9 @@ mod tests {
         fn set_otp_required(&mut self, required: bool) {
             self.journal.borrow_mut().push(format!("otp {}", required));
         }
+        fn set_checking(&mut self, checking: bool) {
+            self.journal.borrow_mut().push(format!("checking {}", checking));
+        }
         fn set_busy(&mut self, busy: bool) {
             self.journal.borrow_mut().push(format!("busy {}", busy));
         }
@@ -1706,6 +1797,7 @@ mod tests {
         fn open_login(&mut self, form: LoginForm) -> Option<FakeLogin> {
             self.next_id += 1;
             self.journal.borrow_mut().push(format!("login {} {:?}", form.tunnel, form.notice));
+            self.journal.borrow_mut().push(format!("opened checking {} otp {}", form.checking, form.otp_required));
             let values = ("alice".to_string(), "Secret,1234".to_string(), String::new());
             Some(FakeLogin { id: self.next_id, values, journal: self.journal.clone() })
         }
@@ -1775,6 +1867,66 @@ mod tests {
         // an answer of an earlier connection is dropped
         app.on_status("Office", generation - 1, status(r#"{"authenticated":true,"user":"alice"}"#));
         assert_eq!(app.tunnels[0].session, Session::NoOtp);
+    }
+
+    #[test]
+    fn the_window_checks_the_server_before_its_fields() {
+        let (mut app, journal) = app();
+        let off = TunnelInfo {
+            name: "Office".into(),
+            login: Some("http://10.103.1.1:8181/".into()),
+            routes: vec!["10.103.1.0/24".into()],
+            ..TunnelInfo::default()
+        };
+        app.on_list(Instant::now(), Ok(Response { ok: true, tunnels: vec![off], can_manage: true, ..Response::default() }));
+        // Connect: the window opens at once, without fields while the tunnel comes up
+        app.connect("Office");
+        assert!(journal.borrow().contains(&"opened checking true otp true".to_string()));
+        assert!(app.windows[0].checking);
+        // Enter does nothing yet
+        let id = app.windows[0].view.id();
+        app.submit(id);
+        assert!(!journal.borrow().iter().any(|line| line.starts_with("busy") || line.starts_with("error Some")));
+        assert!(!app.windows[0].pending_submit);
+        // on, the login page doesn't answer yet: still checking
+        office_on(&mut app);
+        let generation = app.tunnels[0].generation;
+        app.on_status("Office", generation, ApiResult::default());
+        assert!(app.windows[0].checking);
+        // it asks a password only: the fields, without the code
+        app.on_status("Office", generation, status(r#"{"authenticated":false,"otp_required":false,"server":"HQ"}"#));
+        let lines = journal.borrow().clone();
+        let otp = lines.iter().position(|line| line == "otp false").unwrap();
+        let fields = lines.iter().position(|line| line == "checking false").unwrap();
+        assert!(otp < fields);
+        assert!(!app.windows[0].checking);
+        // now Connect logs in
+        app.submit(id);
+        assert!(journal.borrow().contains(&"busy true".to_string()));
+        // the window opened by itself when the status is known has its fields at once
+        let (mut app, journal) = self::app();
+        office_on(&mut app);
+        let generation = app.tunnels[0].generation;
+        app.on_status("Office", generation, status(r#"{"authenticated":false,"otp_required":false}"#));
+        assert!(journal.borrow().contains(&"opened checking false otp false".to_string()));
+        assert!(!app.windows[0].checking);
+    }
+
+    #[test]
+    fn no_answer_with_a_login() {
+        let (mut app, journal) = app();
+        office_on(&mut app);
+        let generation = app.tunnels[0].generation;
+        // on for a minute without a handshake, the window open: it may be enrolled on another device
+        app.tunnels[0].info.since = unix_now() - 60;
+        app.connect("Office");
+        app.on_status("Office", generation, ApiResult::default());
+        assert!(app.tunnels[0].no_answer());
+        assert!(journal.borrow().contains(&format!("error {:?}", Some(strings::ERROR_NO_ANSWER_LOGIN))));
+        // without a login page: only the server or the network
+        let tunnel = &mut app.tunnels[0];
+        (tunnel.page, tunnel.info.login) = (None, None);
+        assert_eq!(tunnel.no_answer_text(), strings::ERROR_NO_ANSWER);
     }
 
     #[test]
@@ -1873,6 +2025,35 @@ mod tests {
         app.on_status("Office", generation, device(r#","this_device":false"#));
         assert!(app.windows.is_empty() && app.tunnels[0].stopping);
         assert!(journal.borrow().contains(&format!("notify true {}", strings::ERROR_OTHER_DEVICE)));
+    }
+
+    #[test]
+    fn the_key_of_this_computer_once_per_connection() {
+        let logged_in = |key: &str| {
+            status(&format!(
+                r#"{{"authenticated":true,"user":"alice","expires":"2030-01-01T00:00:00+00:00","otp_required":false,"device":{{"required":true,"enrolled":true,"enrollment_open":false,"this_device":true,"challenge":"C1","wireguard_key":"{}"}}}}"#,
+                key
+            ))
+        };
+        let (mut app, _) = app();
+        office_on(&mut app);
+        let generation = app.tunnels[0].generation;
+        // the server took a key of this computer already: nothing to give
+        app.on_status("Office", generation, logged_in("device"));
+        assert_eq!(app.tunnels[0].session, Session::LoggedIn);
+        assert!(app.tunnels[0].binding && !app.tunnels[0].key_asked);
+        // the key of the file: asked once in this connection
+        app.on_status("Office", generation, logged_in("configuration"));
+        assert!(app.tunnels[0].key_asked);
+        // the next connection asks again, if the server still has the key of the file
+        app.tunnels[0].on_up(Instant::now());
+        assert!(!app.tunnels[0].key_asked);
+        // not logged in: later
+        let generation = app.tunnels[0].generation;
+        let mut result = logged_in("configuration");
+        result.data.insert("authenticated".into(), serde_json::Value::Bool(false));
+        app.on_status("Office", generation, result);
+        assert!(!app.tunnels[0].key_asked);
     }
 
     #[test]

@@ -17,6 +17,8 @@ use crate::reg::{self, Key};
 use crate::win::{last_error_message, new_guid, parse_guid, guid_to_string};
 
 const ENTROPY: &[u8] = b"tunnel configuration";
+// the keys this computer made for the tunnel, see conf::OwnKeys, encrypted the same way
+const KEYS: &str = "Keys";
 
 // of the network adapter of a tunnel: the same at every connection, for Windows to know the network again
 pub type Id = GUID;
@@ -83,7 +85,31 @@ pub fn save(name: &str, text: &str) -> Result<Stored, String> {
         }
     };
     key.set_binary("Config", &blob)?;
+    // another configuration file: the keys made for the old one don't belong to it
+    key.delete_value(KEYS);
     Ok(Stored { name: name.to_string(), text: text.to_string(), id: guid })
+}
+
+pub fn load_keys(name: &str) -> conf::OwnKeys {
+    let Some(blob) = Key::open(root(), &path(name)).and_then(|key| key.get_binary(KEYS)) else {
+        return conf::OwnKeys::default();
+    };
+    match unprotect(&blob).map(|data| String::from_utf8(data).unwrap_or_default()) {
+        Ok(text) => conf::OwnKeys::from_text(&text),
+        Err(error) => {
+            log!("{}: can't read the keys of this computer: {}", name, error);
+            conf::OwnKeys::default()
+        }
+    }
+}
+
+pub fn save_keys(name: &str, keys: &conf::OwnKeys) -> Result<(), String> {
+    let key = Key::open_writable(root(), &path(name)).ok_or("not found")?;
+    if keys.is_empty() {
+        key.delete_value(KEYS);
+        return Ok(());
+    }
+    key.set_binary(KEYS, &protect(keys.to_text().as_bytes())?)
 }
 
 pub fn delete(name: &str) -> Result<(), String> {
@@ -165,14 +191,28 @@ mod tests {
         assert!(!blob.windows(6).any(|part| part == b"secret"));
         let read = load(name).unwrap();
         assert_eq!(read.text, "secret text");
+        // the keys this computer made, encrypted too, then gone with a new configuration
+        let keys = conf::OwnKeys { own: Some([3; 32]), pending: None };
+        save_keys(name, &keys).unwrap();
+        assert_eq!(load_keys(name), keys);
+        let blob = Key::open(root(), &path(name)).unwrap().get_binary(KEYS).unwrap();
+        assert!(!blob.windows(3).any(|part| part == b"own"));
+        save(name, "secret text").unwrap();
+        assert_eq!(load_keys(name), conf::OwnKeys::default());
+        save_keys(name, &keys).unwrap();
+        save_keys(name, &conf::OwnKeys::default()).unwrap();
+        assert!(load_keys(name).is_empty());
         // replaced, with the same GUID
         let second = save(name, "other").unwrap();
         assert_eq!(guid_to_string(&first.id), guid_to_string(&second.id));
         assert!(list().iter().any(|stored| stored.name == name));
+        save_keys(name, &keys).unwrap();
         // renamed, with the same GUID; only the case too
         rename(name, "store test 2").unwrap();
         assert!(!exists(name));
         assert_eq!(guid_to_string(&load("store test 2").unwrap().id), guid_to_string(&first.id));
+        // the keys follow
+        assert_eq!(load_keys("store test 2"), keys);
         rename("store test 2", name).unwrap();
         rename(name, "Store Test").unwrap();
         assert!(list().iter().any(|stored| stored.name == "Store Test"));

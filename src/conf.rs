@@ -306,6 +306,43 @@ pub fn encode_key(key: &Key) -> String {
     base64(key)
 }
 
+// The WireGuard keys this computer made for a tunnel, for a server with device binding (ns-wgauth): `own`, the one
+// the server takes, used in place of the key of the configuration file, and `pending`, one it may take: sent to the
+// server and not confirmed yet, or not taken anymore. Stored apart from the configuration, one line each.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OwnKeys {
+    pub own: Option<Key>,
+    pub pending: Option<Key>,
+}
+
+impl OwnKeys {
+    pub fn is_empty(&self) -> bool {
+        self.own.is_none() && self.pending.is_none()
+    }
+
+    pub fn to_text(&self) -> String {
+        let mut text = String::new();
+        for (label, key) in [("own", self.own), ("pending", self.pending)] {
+            if let Some(key) = key {
+                text += &format!("{} {}\n", label, encode_key(&key));
+            }
+        }
+        text
+    }
+
+    pub fn from_text(text: &str) -> OwnKeys {
+        let mut keys = OwnKeys::default();
+        for line in text.lines() {
+            match line.split_once(' ') {
+                Some(("own", key)) => keys.own = parse_key(key),
+                Some(("pending", key)) => keys.pending = parse_key(key),
+                _ => {}
+            }
+        }
+        keys
+    }
+}
+
 // Standard base64, with padding
 pub fn base64(data: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -626,6 +663,19 @@ mod tests {
         // a different last character carries bits beyond the 32 bytes
         assert!(parse_key("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB=").is_none());
         assert!(parse_key("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA*=").is_none());
+    }
+
+    #[test]
+    fn keys_of_this_computer() {
+        let both = OwnKeys { own: parse_key(PRIVATE), pending: Some([0; 32]) };
+        let text = both.to_text();
+        assert_eq!(text, format!("own {}\npending {}\n", PRIVATE, encode_key(&[0; 32])));
+        assert_eq!(OwnKeys::from_text(&text), both);
+        let pending = OwnKeys { own: None, pending: Some([0; 32]) };
+        assert_eq!(OwnKeys::from_text(&pending.to_text()), pending);
+        assert!(OwnKeys::default().to_text().is_empty() && OwnKeys::from_text("").is_empty());
+        // a broken line is ignored
+        assert_eq!(OwnKeys::from_text("own nonsense\nother line\n"), OwnKeys::default());
     }
 
     #[test]

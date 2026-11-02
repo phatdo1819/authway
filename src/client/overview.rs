@@ -158,7 +158,7 @@ fn hint(tunnel: &Tunnel) -> Option<String> {
         return tunnel.error.as_deref().map(strings::error_connect);
     }
     if tunnel.no_answer() {
-        return Some(strings::ERROR_NO_ANSWER.to_string());
+        return Some(tunnel.no_answer_text().to_string());
     }
     refusal_text(tunnel.session).map(str::to_string)
 }

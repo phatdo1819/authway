@@ -43,8 +43,9 @@ All the names of the app are in [src/product.rs](src/product.rs), and the name o
    file** (recommended: the file holds the keys), **Connect and keep the file** or **Not now**. The VPN takes the
    name of the server, so a second file of the same server, for another user for example, asks first: **Keep both**
    adds it as `Office 2`, **Replace** puts it in the place of the VPN already there.
-3. Turn on the switch of the VPN: the login window asks for username, password and code while the tunnel comes up.
-   The sixth digit of the code connects.
+3. Turn on the switch of the VPN: the login window shows the connection to the server, then asks what the server
+   asks: username and password, and the code of the authenticator app when the server requires one. The sixth digit
+   of the code connects.
 
 **The window** shows a card for each VPN: its switch, the server, its state in words and in color (green connected,
 amber waiting for the login or the server, red refused, with what to do), and, while it's on, its speed and for how
@@ -71,6 +72,12 @@ the VPN off a second or two after it comes up, before any login, and says it's e
 connection would take the one of the enrolled computer. On a new computer, or after removing the VPN from the app,
 ask the administrator to allow a new device.
 
+Right after that first login, the app gives the VPN a key of this computer, when the firewall supports it: the
+configuration file then no longer connects at all, on any computer, not even in the official WireGuard apps. The
+tunnel reconnects once, within seconds, and the session goes on. **All details** says it: *Key: Made by this
+computer*. The file is still needed after a reinstall: the administrator allows a new device, and the VPN added
+again from the file enrolls this computer again.
+
 When the session ends on the firewall (it expired, or the computer changed network), the window opens again with the
 username and the saved password: only the code is needed. **Cancel** or **Disconnect** turns the tunnel off; the
 app logs out first. Quitting the app turns the tunnels off.
@@ -94,11 +101,11 @@ The MSI package installs for the whole computer, so Intune, Group Policy or any 
 can install it. As administrator, without windows:
 
 ```
-msiexec /i authway-0.1.0-x64-unsigned.msi /qn
+msiexec /i authway-0.2.0-x64-unsigned.msi /qn
 "C:\Program Files\Authway\authway.exe" --import "C:\path\office.conf" --name "Office"
 "C:\Program Files\Authway\authway.exe" --rename "Office" --to "Head office"
 "C:\Program Files\Authway\authway.exe" --remove "Office"
-msiexec /x authway-0.1.0-x64-unsigned.msi /qn
+msiexec /x authway-0.2.0-x64-unsigned.msi /qn
 ```
 
 - **Install**: the app starts at once for every user signed in, and at every sign-in after, with its window unless
@@ -113,7 +120,10 @@ msiexec /x authway-0.1.0-x64-unsigned.msi /qn
 - **Device binding** (`device_binding` of a NethSecurity WireGuard server): the first login of each VPN enrolls this
   computer, then only it can log in. An update keeps the keys; removing a VPN, or the app, deletes them, and the next
   login needs a new enrollment, allowed on the firewall (**Allow a new device** in the menu of the peer). The
-  administrator of the firewall sees the computer name of each enrolled device.
+  administrator of the firewall sees the computer name of each enrolled device. After the enrollment the VPN gets a
+  WireGuard key of this computer, and the configuration file stops connecting: a file deployed with the app is a
+  one-time ticket, useless once the computer has enrolled. See [the pros and cons](#device-binding-pros-and-cons)
+  before turning it on.
 - The package is for x64 or ARM64 Windows 10 version 2004 or later, or Windows 11: it refuses the wrong computer.
   The folder is always `C:\Program Files\Authway`.
 
@@ -142,7 +152,7 @@ can connect and disconnect the VPNs that are there; no group membership is neede
 them without that permission:
 
 - check **Every user of this computer** on the page *Who can add VPNs* of the setup, or install with
-  `msiexec /i authway-0.1.0-x64-unsigned.msi /qn ALLOWUSERIMPORT=1`. An update keeps the choice; `ALLOWUSERIMPORT=0`
+  `msiexec /i authway-0.2.0-x64-unsigned.msi /qn ALLOWUSERIMPORT=1`. An update keeps the choice; `ALLOWUSERIMPORT=0`
   takes it back. The setup saves it as `AllowUserImport` = 1 in `HKLM\SOFTWARE\Authway`.
 - or the policy `AllowUserImport` = 1, below: it applies at once, and the policy, 0 or 1, wins over the setup.
 
@@ -157,6 +167,64 @@ Policies, as DWORD values in `HKLM\SOFTWARE\Policies\Authway`:
 ```
 reg add "HKLM\SOFTWARE\Policies\Authway" /v AllowUserImport /t REG_DWORD /d 1 /f
 ```
+
+### Device binding: pros and cons
+
+Device binding is an option of a WireGuard server with the login on the firewall (**Device binding**, and
+optionally **Machine ID**). What each client can do with the configuration file of a peer:
+
+| With the file of the peer | Before the first login | Enrolled, the firewall still takes the key of the file | Enrolled, with the WireGuard key of the computer |
+|---|---|---|---|
+| Authway on the enrolled computer | its first login enrolls it | connects and logs in | connects and logs in: the only client that still connects |
+| Authway on another computer | enrolls if it logs in first | turned off before any login: *enrolled on another device* | no handshake: *The VPN server doesn't answer...* |
+| Official WireGuard apps | connect, but reach only the login page and ping | the same; they take the endpoint of the peer from the enrolled computer, and behind the same public IP as the logged-in computer they share its session | no handshake |
+| A web browser, on the login page | refused: *a web browser can't log in* | refused | can't reach the page |
+
+The middle column lasts only seconds with this version of Authway and the ns-wgauth of the `ci-wgauth` branch: the
+app gives the computer's key right after the first login. It lasts as long as the enrollment with Authway 0.1.0 or a
+firewall without that support, and it comes back for a few seconds each time the WireGuard interface restarts on
+the firewall.
+
+**Pros**
+
+- A copied configuration file is useless on another computer, even with the password and the code of the
+  authenticator app.
+- Once the computer has its WireGuard key, a copy gets no handshake at all, in Authway or in the official apps. It
+  can't reach the login page, can't take the endpoint of the enrolled computer, and can't share its session from
+  behind the same public IP. The copy alerts and blocked peers that a copy caused go away with it.
+- A file deployed with the app (Intune, Group Policy, a shared folder) is a one-time ticket: once the computer has
+  enrolled, a leaked copy of it, or of the deployment share, is worth nothing.
+- The administrator of the firewall sees the name of the enrolled computer of each peer, when it enrolled, and the
+  public IP of its latest login.
+- With the machine ID, a device key copied by an administrator of the computer doesn't work on another computer,
+  unless the client is modified to send the stolen ID.
+- Nothing to do for the user: the app enrolls the computer and gives its key by itself, at the first login.
+
+**Cons**
+
+- Only Authway can log in, on Windows and macOS: not the official WireGuard apps, not a web browser, and there's no
+  Authway for iOS or Android. A user who also needs the VPN on a phone needs a peer on another server, without device
+  binding: the firewall allows one peer per user on each server.
+- One computer per peer. A new computer, a reinstall, removing the VPN or the app, or importing the file again: the
+  VPN stops working there until the administrator clicks **Allow a new device** on the peer, and the next login
+  enrolls again. Expect requests to the help desk.
+- The configuration downloaded again from the firewall doesn't connect either, once the computer has its key: only
+  **Allow a new device** lets a file connect again.
+- The messages can't say why. WireGuard never answers a key it doesn't know, so a copy only sees *The VPN server
+  doesn't answer...*, as when the server is down, and the firewall logs nothing about it: the copy detection has
+  nothing left to report.
+- The enrollment of a new peer stays open for 72 hours by default (`enroll_window` on the firewall): a user who
+  doesn't log in within that time needs **Allow a new device**. Until then, whoever logs in first with Authway, the
+  file, the password and the code, becomes the enrolled device.
+- With the machine ID, a new motherboard, or a virtual machine moved to another host, can change the ID: that needs a
+  new enrollment too.
+- The keys are software keys. A normal user of the computer can't read them, but an administrator of the computer
+  can copy the device key and the WireGuard key, and malware on the enrolled computer can use them where they are.
+  Keys in the TPM or the Secure Enclave aren't done.
+- The file connects again for a few seconds each time the WireGuard interface restarts on the firewall (any change
+  to a peer of the server restarts it), and from **Allow a new device** until the next enrollment.
+- It needs the firewall of the ns-wgauth fork with a local users database: official NethSecurity has no login and
+  no device binding.
 
 ## How it works
 
@@ -232,6 +300,17 @@ reg add "HKLM\SOFTWARE\Policies\Authway" /v AllowUserImport /t REG_DWORD /d 1 /f
   (empty when the tunnel has none, and no key is made for that): when the page answers that another device is
   enrolled (`this_device` false), the app takes the tunnel down at once and doesn't connect again by itself. A
   firewall without this answer changes nothing.
+- **The WireGuard key of this computer**: once logged in on a server with device binding whose status says
+  `"wireguard_key": "configuration"`, the app asks the service for a new WireGuard key. The service makes it with the
+  random generator of the system, keeps it as *pending* with the tunnel (encrypted like the configuration, a
+  `Keys` value; a `<name>.keys` file on macOS), and signs it with the device key
+  ([device::wireguard_key](src/device.rs)). The app sends it (`POST /api/device-key`); on `200` the service makes it
+  the key of the tunnel, the private key changes in place and the next packet makes a handshake. The configuration
+  stays as it was imported: its key comes back when the firewall takes it again. While a key gets no handshake
+  although packets go (30 seconds, or 200 for a key that worked), the service tries the other keys of the tunnel:
+  the pending one when the answer of the firewall was lost, the one of the file after a new enrollment on the
+  firewall. A handshake decides ([src/manager.rs](src/manager.rs)). Importing a new file for the VPN forgets the keys
+  made for the old one.
 - **The passwords** are in the Credential Manager of the user (`Authway/http://10.103.1.1:8181`), on this
   computer only, if the user checked "Remember my password".
 - **The pipe** lets the signed-in users read and write, not create another instance of it; the app checks that the
@@ -321,6 +400,14 @@ also accepted by the `verify_device` of the firewall, and refused with another u
 machines, the Windows and the macOS client each enrolled their VPN on the test firewall, and a copy of the same
 `.conf` on the other computer was refused.
 
+The WireGuard key of this computer: the unit tests check the key stored and its format, the message signed, which
+key the service tries after a silence and what a handshake decides, and when the app asks. A request signed by
+`device::wireguard_key` was accepted by the `verify_wireguard_key` of the firewall, and refused for another address,
+key or server. Without windows, the test build of the service and the real code of the ns-wgauth daemon went through
+the whole exchange: enrollment, the new key taken and put on the interface of the (fake) firewall, the session
+going on, the next login, a key in use refused, the next connection with the new key, the keys removed with the VPN.
+Not tested yet: on the test machines, with real tunnels.
+
 The MSI package for ARM64 was tested as administrator on Windows 11: the x64 one refused, the install, the rights
 and restarts of the service, two tunnels through the installed `wireguard.dll`, the steps for the apps as SYSTEM, an
 update that keeps the VPNs and restarts the app, and a removal that leaves nothing, the driver included.
@@ -351,7 +438,7 @@ app can show them.
 **For the administrators.**
 
 ```
-sudo installer -pkg authway-0.1.0-macos-unsigned.pkg -target /
+sudo installer -pkg authway-0.2.0-macos-unsigned.pkg -target /
 sudo /Applications/Authway.app/Contents/MacOS/authway --import ~/Downloads/office.conf --name "Office"
 sudo /Applications/Authway.app/Contents/MacOS/authway --remove "Office"
 sudo "/Library/Application Support/Authway/uninstall.sh"
@@ -406,7 +493,8 @@ sudo "/Library/Application Support/Authway/uninstall.sh"
   asking for 2 minutes.
 - **The login** goes only through the tunnel, as on Windows, with `IP_BOUND_IF` in place of `IP_UNICAST_IF`.
 - **The configurations** are files of root, `/Library/Application Support/Authway/tunnels/<name>.conf`, readable by
-  root only. **The passwords** are in the login keychain of the user, under `Authway/http://10.103.1.1:8181`.
+  root only, with `<name>.keys` for the WireGuard keys this computer made. **The passwords** are in the login
+  keychain of the user, under `Authway/http://10.103.1.1:8181`.
 - **The device keys** of device binding are P-256 keys made by the Security framework, in
   `/Library/Application Support/Authway/devices/<name>.key`, readable by root only; the machine ID is the
   `IOPlatformUUID` of the Mac. Not in the Secure Enclave yet.

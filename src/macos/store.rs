@@ -59,13 +59,18 @@ pub fn exists(name: &str) -> bool {
     path(name).exists()
 }
 
-// written whole, then renamed over the old one
-pub fn save(name: &str, text: &str) -> Result<Stored, String> {
+// the keys this computer made for the tunnel, see conf::OwnKeys, next to its configuration
+fn keys_path(name: &str) -> PathBuf {
+    folder().join(format!("{}.keys", name))
+}
+
+// written whole, readable by root only, then renamed over the old one
+fn write_private(file_name: &str, target: &PathBuf, text: &str) -> Result<(), String> {
     let folder = folder();
     DirBuilder::new().recursive(true).mode(0o700).create(&folder).map_err(|error| error.to_string())?;
     // a folder made before, with other rights
     let _ = fs::set_permissions(&folder, fs::Permissions::from_mode(0o700));
-    let temporary = folder.join(format!(".{}.new", name));
+    let temporary = folder.join(format!(".{}.new", file_name));
     let _ = fs::remove_file(&temporary);
     let mut file = OpenOptions::new()
         .write(true)
@@ -74,18 +79,51 @@ pub fn save(name: &str, text: &str) -> Result<Stored, String> {
         .open(&temporary)
         .map_err(|error| error.to_string())?;
     file.write_all(text.as_bytes()).and_then(|_| file.sync_all()).map_err(|error| error.to_string())?;
-    fs::rename(&temporary, path(name)).map_err(|error| error.to_string())?;
+    fs::rename(&temporary, target).map_err(|error| error.to_string())
+}
+
+fn remove(target: &PathBuf) -> Result<(), String> {
+    match fs::remove_file(target) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.to_string()),
+        _ => Ok(()),
+    }
+}
+
+pub fn save(name: &str, text: &str) -> Result<Stored, String> {
+    write_private(name, &path(name), text)?;
+    // another configuration file: the keys made for the old one don't belong to it
+    let _ = remove(&keys_path(name));
     Ok(Stored { name: name.to_string(), text: text.to_string(), id: Id })
+}
+
+pub fn load_keys(name: &str) -> conf::OwnKeys {
+    match fs::read_to_string(keys_path(name)) {
+        Ok(text) => conf::OwnKeys::from_text(&text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => conf::OwnKeys::default(),
+        Err(error) => {
+            log!("{}: can't read the keys of this computer: {}", name, error);
+            conf::OwnKeys::default()
+        }
+    }
+}
+
+pub fn save_keys(name: &str, keys: &conf::OwnKeys) -> Result<(), String> {
+    if keys.is_empty() {
+        return remove(&keys_path(name));
+    }
+    write_private(&format!("{}.keys", name), &keys_path(name), &keys.to_text())
 }
 
 // in place, the case alone too
 pub fn rename(name: &str, new_name: &str) -> Result<(), String> {
-    fs::rename(path(name), path(new_name)).map_err(|error| error.to_string())
+    fs::rename(path(name), path(new_name)).map_err(|error| error.to_string())?;
+    if keys_path(name).exists() {
+        fs::rename(keys_path(name), keys_path(new_name)).map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 pub fn delete(name: &str) -> Result<(), String> {
-    match fs::remove_file(path(name)) {
-        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.to_string()),
-        _ => Ok(()),
-    }
+    remove(&path(name))?;
+    remove(&keys_path(name))
 }

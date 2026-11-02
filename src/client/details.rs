@@ -213,6 +213,10 @@ pub fn details(tunnel: &Tunnel) -> Details {
     details.row(strings::DETAIL_LISTEN_PORT, port);
     if !info.public_key.is_empty() {
         details.row(strings::DETAIL_PUBLIC_KEY, &info.public_key);
+        // a server with device binding took a key of this computer
+        if info.own_key {
+            details.row(strings::DETAIL_KEY, strings::VALUE_OWN_KEY);
+        }
     }
     if let Some(device) = &info.device {
         details.row(strings::DETAIL_DEVICE, device);

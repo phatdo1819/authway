@@ -219,6 +219,18 @@ impl Adapter {
         result
     }
 
+    // another private key: the peers stay, the driver forgets their sessions and makes new handshakes
+    pub fn set_private_key(&self, key: &Key) -> Result<(), String> {
+        let mut buffer = build_private_key(key);
+        let bytes = (buffer.len() * 8) as u32;
+        let ok = unsafe { (self.wireguard.set_configuration)(self.handle, buffer.as_ptr() as *const WgInterface, bytes) };
+        wipe(&mut buffer);
+        if ok == 0 {
+            return Err(format!("can't change the key of the tunnel: {}", last_error_message()));
+        }
+        Ok(())
+    }
+
     // another address for a server: the rest stays as it is, its session included
     pub fn set_endpoint(&self, public_key: &Key, endpoint: &SocketAddr) -> Result<(), String> {
         let buffer = build_endpoint(public_key, endpoint);
@@ -373,6 +385,18 @@ fn build_config(config: &Config, endpoints: &[Option<SocketAddr>]) -> Vec<u64> {
     buffer
 }
 
+// The interface with its private key only, and no peer: the peers stay as they are
+fn build_private_key(key: &Key) -> Vec<u64> {
+    let mut buffer = vec![0u64; size_of::<WgInterface>() / 8];
+    // SAFETY: the buffer is zeroed, 8-aligned and as long as the struct
+    unsafe {
+        let interface = &mut *(buffer.as_mut_ptr() as *mut WgInterface);
+        interface.flags = INTERFACE_HAS_PRIVATE_KEY;
+        interface.private_key = *key;
+    }
+    buffer
+}
+
 // The interface with no flag, so nothing of it changes, and the one peer, only if it's there
 fn build_endpoint(public_key: &Key, endpoint: &SocketAddr) -> Vec<u64> {
     let mut buffer = vec![0u64; (size_of::<WgInterface>() + size_of::<WgPeer>()) / 8];
@@ -479,6 +503,15 @@ mod tests {
             assert_eq!((peer.public_key, peer.allowed_ips_count, peer.persistent_keepalive), (key, 0, 0));
             assert_eq!(from_sockaddr(&peer.endpoint), Some(endpoint));
         }
+    }
+
+    #[test]
+    fn another_private_key() {
+        let buffer = build_private_key(&[5; 32]);
+        assert_eq!(buffer.len() * 8, 80);
+        let interface = unsafe { &*(buffer.as_ptr() as *const WgInterface) };
+        // the key only: the port and the peers stay
+        assert_eq!((interface.flags, interface.peers_count, interface.private_key), (INTERFACE_HAS_PRIVATE_KEY, 0, [5; 32]));
     }
 
     #[test]

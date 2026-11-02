@@ -1,5 +1,6 @@
 // The window that connects a VPN whose server requires a login: username, password and the code of the
-// authenticator app. It opens as the tunnel comes up, so the user types while it connects.
+// authenticator app. It opens as the tunnel comes up, with a progress bar until the login page says what it asks, then
+// with the fields it asks.
 
 use std::mem::{replace, size_of, zeroed};
 use std::ptr;
@@ -12,7 +13,9 @@ use windows_sys::Win32::Graphics::Gdi::{
     RDW_INVALIDATE,
 };
 use windows_sys::Win32::System::SystemServices::SS_NOPREFIX;
-use windows_sys::Win32::UI::Controls::{BST_CHECKED, BST_UNCHECKED, EM_SETCUEBANNER, EM_SETLIMITTEXT, EM_SETSEL};
+use windows_sys::Win32::UI::Controls::{
+    BST_CHECKED, BST_UNCHECKED, EM_SETCUEBANNER, EM_SETLIMITTEXT, EM_SETSEL, PBM_SETMARQUEE, PBS_MARQUEE,
+};
 use windows_sys::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -30,8 +33,7 @@ use super::{
     add_dialog, child, get_text, instance, line_height, measure, place_all, remove_dialog, scale, set_font, set_text,
     Fonts,
 };
-use crate::client::{LoginValues, LoginView, OTP_LENGTH};
-use crate::creds::SavedLogin;
+use crate::client::{LoginForm, LoginValues, LoginView, OTP_LENGTH};
 use crate::log;
 use crate::names::PRODUCT;
 use crate::strings;
@@ -50,6 +52,7 @@ const ID_PASSWORD: i32 = 106;
 const ID_REMEMBER: i32 = 107;
 const ID_CODE: i32 = 109;
 const ID_ERROR: i32 = 110;
+const ID_PROGRESS: i32 = 111;
 
 // COLORREF is 0x00bbggrr
 const ERROR_COLOR: u32 = 0x001c_1cb9;
@@ -71,10 +74,12 @@ pub struct ConnectWindow {
     remember: HWND,
     code_label: HWND,
     code: HWND,
+    progress: HWND,
     error: HWND,
     ok: HWND,
     cancel: HWND,
     otp_required: bool,
+    checking: bool,
     can_remember: bool,
     has_notice: bool,
     has_error: bool,
@@ -103,15 +108,9 @@ fn show(window: HWND, visible: bool) {
 }
 
 impl ConnectWindow {
-    pub fn open(
-        tunnel: &str,
-        heading: &str,
-        hint: &str,
-        saved: &SavedLogin,
-        can_remember: bool,
-        otp_required: bool,
-        notice: Option<&str>,
-    ) -> Option<ConnectWindow> {
+    pub fn open(form: LoginForm) -> Option<ConnectWindow> {
+        let saved = form.saved;
+        let can_remember = form.can_remember;
         register_class();
         // on the display with the mouse
         let mut cursor = POINT { x: 0, y: 0 };
@@ -148,11 +147,11 @@ impl ConnectWindow {
         let edit = WS_TABSTOP | ES_AUTOHSCROLL as u32;
         let mut window = ConnectWindow {
             hwnd,
-            tunnel: tunnel.to_string(),
+            tunnel: form.tunnel.to_string(),
             busy: false,
             dpi,
-            heading: child(hwnd, "STATIC", heading, label, 0, ID_HEADING),
-            hint: child(hwnd, "STATIC", hint, label, 0, ID_HINT),
+            heading: child(hwnd, "STATIC", form.heading, label, 0, ID_HEADING),
+            hint: child(hwnd, "STATIC", form.hint, label, 0, ID_HINT),
             notice: child(hwnd, "STATIC", "", label, 0, ID_NOTICE),
             username_label: child(hwnd, "STATIC", strings::LOGIN_USERNAME, label, 0, 0),
             username: child(hwnd, "EDIT", &saved.username, edit, WS_EX_CLIENTEDGE, ID_USERNAME),
@@ -161,11 +160,13 @@ impl ConnectWindow {
             remember: child(hwnd, "BUTTON", strings::LOGIN_REMEMBER, WS_TABSTOP | BS_AUTOCHECKBOX as u32, 0, ID_REMEMBER),
             code_label: child(hwnd, "STATIC", strings::LOGIN_OTP, label, 0, 0),
             code: child(hwnd, "EDIT", "", edit | ES_NUMBER as u32, WS_EX_CLIENTEDGE, ID_CODE),
+            progress: child(hwnd, "msctls_progress32", "", PBS_MARQUEE, 0, ID_PROGRESS),
             error: child(hwnd, "STATIC", "", label, 0, ID_ERROR),
             ok: child(hwnd, "BUTTON", strings::LOGIN_CONNECT, WS_TABSTOP | BS_DEFPUSHBUTTON as u32, 0, IDOK),
             cancel: child(hwnd, "BUTTON", strings::CANCEL, WS_TABSTOP | BS_PUSHBUTTON as u32, 0, IDCANCEL),
             fonts,
-            otp_required,
+            otp_required: form.otp_required,
+            checking: form.checking,
             can_remember,
             has_notice: false,
             has_error: false,
@@ -184,8 +185,7 @@ impl ConnectWindow {
         // checked the first time, then as the user left it
         let checked = can_remember && (saved.password.is_some() || saved.username.is_empty());
         unsafe { SendMessageW(window.remember, BM_SETCHECK, if checked { BST_CHECKED } else { BST_UNCHECKED } as usize, 0) };
-        show(window.remember, can_remember);
-        window.set_notice(notice);
+        window.set_notice(form.notice);
         window.layout();
         // in the middle of the display, above the other windows the first time
         let mut rect: RECT = unsafe { zeroed() };
@@ -259,23 +259,39 @@ impl ConnectWindow {
             place(self.notice, margin, y, width, height);
             y += height + s(12);
         }
-        for (label, field) in [(self.username_label, self.username), (self.password_label, self.password)] {
-            place(label, margin, y + (edit_height - line) / 2, label_width, line);
-            place(field, field_x, y, field_width, edit_height);
-            y += edit_height + gap;
+        let fields = !self.checking;
+        for control in [self.username_label, self.username, self.password_label, self.password, self.ok] {
+            show(control, fields);
         }
-        if self.can_remember {
-            let height = line + s(6);
-            place(self.remember, field_x, y - s(4), field_width, height);
-            y += height + gap - s(4);
+        show(self.remember, fields && self.can_remember);
+        if fields {
+            for (label, field) in [(self.username_label, self.username), (self.password_label, self.password)] {
+                place(label, margin, y + (edit_height - line) / 2, label_width, line);
+                place(field, field_x, y, field_width, edit_height);
+                y += edit_height + gap;
+            }
+            if self.can_remember {
+                let height = line + s(6);
+                place(self.remember, field_x, y - s(4), field_width, height);
+                y += height + gap - s(4);
+            }
         }
-        show(self.code_label, self.otp_required);
-        show(self.code, self.otp_required);
-        if self.otp_required {
+        let code = fields && self.otp_required;
+        show(self.code_label, code);
+        show(self.code, code);
+        if code {
             let code_height = line_height(hwnd, self.fonts.large) + s(10);
             place(self.code_label, margin, y + (code_height - line) / 2, label_width, line);
             place(self.code, field_x, y, s(120), code_height);
             y += code_height + gap;
+        }
+        // while it checks, until something goes wrong
+        let progress = self.checking && !self.has_error;
+        show(self.progress, progress);
+        unsafe { SendMessageW(self.progress, PBM_SETMARQUEE, progress as usize, 30) };
+        if progress {
+            place(self.progress, margin, y, width, s(14));
+            y += s(14) + gap;
         }
         show(self.error, self.has_error);
         if self.has_error {
@@ -366,6 +382,16 @@ impl ConnectWindow {
         }
     }
 
+    pub fn set_checking(&mut self, checking: bool) {
+        if self.checking != checking {
+            self.checking = checking;
+            self.layout();
+            if !checking {
+                self.focus_first_empty();
+            }
+        }
+    }
+
     pub fn set_busy(&mut self, busy: bool) {
         self.busy = busy;
         for control in [self.username, self.password, self.remember, self.code, self.ok] {
@@ -395,6 +421,11 @@ impl ConnectWindow {
     }
 
     pub fn focus_first_empty(&self) {
+        // not on Cancel, which Enter would press
+        if self.checking {
+            unsafe { SetFocus(self.hwnd) };
+            return;
+        }
         let values = self.values();
         if values.username.is_empty() {
             self.focus(self.username);
@@ -458,6 +489,10 @@ impl LoginView for ConnectWindow {
 
     fn set_otp_required(&mut self, required: bool) {
         ConnectWindow::set_otp_required(self, required);
+    }
+
+    fn set_checking(&mut self, checking: bool) {
+        ConnectWindow::set_checking(self, checking);
     }
 
     fn set_busy(&mut self, busy: bool) {

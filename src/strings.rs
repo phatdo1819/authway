@@ -73,6 +73,12 @@ pub const ERROR_FORBIDDEN: &str = "The login page doesn't accept this VPN connec
 pub const ERROR_UNREACHABLE: &str = "Can't reach the login page. Check your internet connection and try again.";
 pub const ERROR_NO_ANSWER: &str =
     "The VPN server doesn't answer. Check your internet connection, or ask your administrator.";
+// with a login page: once the enrolled device gave the server a key of its own, a copy of the configuration gets no
+// answer at all, WireGuard says nothing to a key it doesn't know
+pub const ERROR_NO_ANSWER_LOGIN: &str = "The VPN server doesn't answer. Please check your internet connection. If your \
+                                         internet connection works, this VPN configuration may be enrolled on another \
+                                         device and you can't use it here. Please contact your administrator for \
+                                         support.";
 pub const ERROR_FAILED: &str = "The login didn't work. Try again in a moment.";
 // with device binding
 pub const ERROR_NOT_ENROLLED: &str = "No device is enrolled for this VPN configuration, and a new one can't enroll. \
@@ -302,6 +308,8 @@ pub const DETAIL_DNS_SEARCH: &str = "DNS search domains";
 pub const DETAIL_MTU: &str = "MTU";
 pub const DETAIL_LISTEN_PORT: &str = "Listen port";
 pub const DETAIL_PUBLIC_KEY: &str = "Public key";
+pub const DETAIL_KEY: &str = "Key";
+pub const VALUE_OWN_KEY: &str = "Made by this computer: the configuration file no longer connects";
 pub const DETAIL_DEVICE: &str = "Name on the server";
 pub const DETAIL_NAME: &str = "Name";
 pub const DETAIL_SERVER: &str = "Server address";

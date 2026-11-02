@@ -9,7 +9,7 @@ pub const SERVICE_NAME: &str = "Authway";
 pub const SERVICE_DISPLAY_NAME: &str = "Authway tunnels";
 pub const SERVICE_DESCRIPTION: &str = "Connects and disconnects the VPN tunnels of Authway.";
 // the publisher, in the installed apps and in the properties of the exe
-pub const MANUFACTURER: &str = "phatdo1819";
+pub const MANUFACTURER: &str = "Authway";
 // the same for every MSI package of the app, so that a new version replaces the installed one: never change it
 pub const UPGRADE_CODE: &str = "{A2E70C27-DA30-4353-A753-EC907223103B}";
 // macOS: the identifier of the app, of its package and, with suffixes, of its launchd jobs: never change it either

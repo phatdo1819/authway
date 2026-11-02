@@ -199,6 +199,13 @@ impl Tunnel for GoTunnel {
             .map_err(|error| format!("can't change the address of the server: {}", error))
     }
 
+    fn set_private_key(&mut self, key: &conf::Key) -> Result<(), String> {
+        let request = uapi::set_private_key(key);
+        let result = self.device.set(&request);
+        wipe(request);
+        result.map_err(|error| format!("can't change the key of the tunnel: {}", error))
+    }
+
     fn after_login(&mut self, on: bool) -> Result<(), String> {
         self.network.after_login(on);
         Ok(())

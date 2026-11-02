@@ -3,6 +3,8 @@
 //        ?device=<ID>  the ID of the device key, see device.rs: with device binding, "device" says "this_device"
 //   POST /api/login    {"username", "password", "otp", "device"}, "device" signed by the service, see device.rs
 //   POST /api/logout
+//   POST /api/device-key  {"challenge", "wireguard_key", "signature"}: once logged in, the enrolled device gives the
+//        peer a WireGuard key of its own, see device::wireguard_key
 // Plain HTTP to an address of the tunnel, never through a proxy. The requests go out only through the network
 // adapter of the tunnel, `interface` (its index), and only to an address of its routes: the password never goes
 // another way, whatever the routes of the local network say.
@@ -15,7 +17,7 @@ use std::time::Duration;
 use serde_json::{Map, Value};
 
 use crate::conf::{Config, IpNet};
-use crate::device::Proof;
+use crate::device::{NewKey, Proof};
 use crate::{log, names, net};
 
 pub const DEFAULT_PORT: u16 = 8181;
@@ -164,6 +166,24 @@ pub fn other_device(status: &ApiResult) -> bool {
     let device = status.data.get("device").and_then(Value::as_object);
     let flag = |key: &str| device.and_then(|device| device.get(key)).and_then(Value::as_bool);
     flag("required") == Some(true) && flag("enrolled") == Some(true) && flag("this_device") == Some(false)
+}
+
+// Whether this computer, logged in and the enrolled device, can give the peer a WireGuard key of its own: the
+// server still has the key of the configuration file. A server that doesn't say "wireguard_key" can't take one.
+pub fn wants_own_key(status: &ApiResult) -> bool {
+    let device = status.data.get("device").and_then(Value::as_object);
+    let flag = |key: &str| device.and_then(|device| device.get(key)).and_then(Value::as_bool);
+    let key = device.and_then(|device| device.get("wireguard_key")).and_then(Value::as_str);
+    status.get_bool("authenticated")
+        && flag("required") == Some(true)
+        && flag("enrolled") == Some(true)
+        && flag("this_device") == Some(true)
+        && key == Some("configuration")
+}
+
+pub fn device_key(page: &Page, interface: u32, request: &NewKey) -> ApiResult {
+    let body = serde_json::to_value(request).unwrap_or_default();
+    send("POST", page, interface, "/api/device-key", Some(&body), REQUEST_TIMEOUT)
 }
 
 pub fn login(
@@ -413,6 +433,23 @@ mod tests {
         let result = ApiResult::from_body(401, br#"{"error":"invalid_credentials","retry_after":30}"#, None);
         assert_eq!(result.to_string(), "HTTP 401 invalid_credentials");
         assert_eq!(result.get_int("retry_after", 60), 30);
+    }
+
+    #[test]
+    fn when_to_give_a_key() {
+        let status = |authenticated: bool, device: &str| {
+            let body = format!(r#"{{"authenticated":{},"device":{{{}}}}}"#, authenticated, device);
+            ApiResult::from_body(200, body.as_bytes(), None)
+        };
+        let enrolled = r#""required":true,"enrolled":true,"this_device":true"#;
+        assert!(wants_own_key(&status(true, &format!(r#"{},"wireguard_key":"configuration""#, enrolled))));
+        // not logged in, given already, an older firewall, another device, the browser
+        assert!(!wants_own_key(&status(false, &format!(r#"{},"wireguard_key":"configuration""#, enrolled))));
+        assert!(!wants_own_key(&status(true, &format!(r#"{},"wireguard_key":"device""#, enrolled))));
+        assert!(!wants_own_key(&status(true, enrolled)));
+        let other = r#""required":true,"enrolled":true,"this_device":false,"wireguard_key":"configuration""#;
+        assert!(!wants_own_key(&status(true, other)));
+        assert!(!wants_own_key(&status(true, r#""required":true,"enrolled":true,"wireguard_key":"configuration""#)));
     }
 
     #[test]

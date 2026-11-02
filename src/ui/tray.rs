@@ -143,7 +143,7 @@ impl Shell for WinShell {
     }
 
     fn open_login(&mut self, form: LoginForm) -> Option<ConnectWindow> {
-        ConnectWindow::open(form.tunnel, form.heading, form.hint, form.saved, form.can_remember, form.otp_required, form.notice)
+        ConnectWindow::open(form)
     }
 
     fn open_details(&mut self, tunnel: &str, details: Details) -> Option<DetailsWindow> {

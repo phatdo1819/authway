@@ -89,6 +89,10 @@ impl Tunnel for DriverTunnel {
         self.adapter.set_endpoint(public_key, &address)
     }
 
+    fn set_private_key(&mut self, key: &conf::Key) -> Result<(), String> {
+        self.adapter.set_private_key(key)
+    }
+
     fn after_login(&mut self, on: bool) -> Result<(), String> {
         crate::net::after_login(self.adapter.luid(), &self.after, &self.dns, &self.dns_search, on)
     }
