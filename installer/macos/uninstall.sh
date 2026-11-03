@@ -18,6 +18,7 @@ quit_apps
 for uid in $(dscl . -list /Users UniqueID | awk '$2 >= 500 { print $2 }'); do
     launchctl bootout "gui/$uid/$BUNDLE_ID" 2>/dev/null
 done
+remove_other_jobs
 stop_service
 
 # The data of each user: the passwords in the keychain, the settings, the log. The keychain of a user who isn't

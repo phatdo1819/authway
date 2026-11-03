@@ -4,5 +4,6 @@
 #@COMMON@
 
 quit_apps
+remove_other_jobs
 stop_service
 exit 0

@@ -24,8 +24,8 @@ if [ ! -x "$wireguard/wireguard-go" ]; then
     exit 1
 fi
 
-# the oldest macOS of the package, for both
-export MACOSX_DEPLOYMENT_TARGET=11.0
+# the oldest macOS of the package, for both: the ones Apple still updates
+export MACOSX_DEPLOYMENT_TARGET=15.0
 for target in aarch64-apple-darwin x86_64-apple-darwin; do
     cargo build --release --target "$target" --manifest-path "$root/Cargo.toml"
 done

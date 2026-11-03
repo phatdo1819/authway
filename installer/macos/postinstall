@@ -14,6 +14,14 @@ mkdir -p "$LOGS"
 chown root:wheel "$DAEMON_PLIST" "$AGENT_PLIST"
 chmod 644 "$DAEMON_PLIST" "$AGENT_PLIST"
 
+# Every user can add VPNs, without the password of an administrator, unless an administrator already chose:
+# AllowUserImport, which updates keep, and a profile wins over it. The apps read the file too.
+POLICY="/Library/Preferences/$BUNDLE_ID"
+if ! /usr/libexec/PlistBuddy -c "Print :AllowUserImport" "$POLICY.plist" >/dev/null 2>&1; then
+    defaults write "$POLICY" AllowUserImport -bool true
+fi
+chmod 644 "$POLICY.plist" 2>/dev/null
+
 stop_service
 launchctl bootstrap system "$DAEMON_PLIST"
 

@@ -1,6 +1,6 @@
 // The settings on macOS: the ones of the administrator in /Library/Preferences/<id>.plist or in a configuration
 // profile (Managed Preferences), the ones of the user in a file of their own
-//   sudo defaults write /Library/Preferences/io.github.phatdo1819.authway AllowUserImport -bool true
+//   sudo defaults write /Library/Preferences/io.authway.client AllowUserImport -bool false
 
 use std::collections::BTreeMap;
 use std::fs;
