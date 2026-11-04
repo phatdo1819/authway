@@ -17,11 +17,11 @@ The MSI package installs for the whole computer, so Intune, Group Policy or any 
 install it. As administrator, without windows:
 
 ```
-msiexec /i authway-0.2.0-x64-unsigned.msi /qn
+msiexec /i authway-0.2.1-x64-unsigned.msi /qn
 "C:\Program Files\Authway\authway.exe" --import "C:\path\office.conf" --name "Office"
 "C:\Program Files\Authway\authway.exe" --rename "Office" --to "Head office"
 "C:\Program Files\Authway\authway.exe" --remove "Office"
-msiexec /x authway-0.2.0-x64-unsigned.msi /qn
+msiexec /x authway-0.2.1-x64-unsigned.msi /qn
 ```
 
 | | |
@@ -75,7 +75,7 @@ reg add "HKLM\SOFTWARE\Policies\Authway" /v AllowUserImport /t REG_DWORD /d 1 /f
 ## macOS
 
 ```
-sudo installer -pkg authway-0.2.0-macos-unsigned.pkg -target /
+sudo installer -pkg authway-0.2.1-macos-unsigned.pkg -target /
 sudo /Applications/Authway.app/Contents/MacOS/authway --import ~/Downloads/office.conf --name "Office"
 sudo /Applications/Authway.app/Contents/MacOS/authway --remove "Office"
 sudo "/Library/Application Support/Authway/uninstall.sh"
@@ -122,7 +122,7 @@ What each client can do with the `.conf` file of a peer:
 | **Official WireGuard apps** | Connect, but reach only the login page and ping | The same; they can take the enrolled computer's endpoint, and share its session from behind the same public IP | No handshake |
 | **A web browser** | Refused: *a web browser can't log in* | Refused | Can't reach the login page |
 
-The middle column lasts only seconds with Authway 0.2.0 and the firewall of the `ci-wgauth` branch, which give the
+The middle column lasts only seconds with Authway 0.2.0 or later and the firewall of the `ci-wgauth` branch, which give the
 computer its key right after the first login. With Authway 0.1.0 or an older firewall it lasts as long as the
 enrollment. It also comes back for a few seconds each time the firewall restarts the WireGuard interface.
 

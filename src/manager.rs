@@ -297,10 +297,18 @@ impl Manager {
         let Some(index) = self.entries.iter().position(|entry| entry.name.eq_ignore_ascii_case(name)) else {
             return Response::failure(ipc::NOT_FOUND, format!("There's no VPN named {}.", name));
         };
-        let entry = &mut self.entries[index];
-        if entry.active.is_some() {
+        if self.entries[index].active.is_some() {
             return Response::success();
         }
+        // One VPN at a time: two tunnels would take the same routes, and one of them would carry nothing while it says
+        // it's connected. The others go off first, with their routes and DNS servers, even if this one can't start.
+        let name = self.entries[index].name.clone();
+        for (other, entry) in self.entries.iter_mut().enumerate() {
+            if other != index && entry.active.take().is_some() {
+                log!("{}: off, {} goes on", entry.name, name);
+            }
+        }
+        let entry = &mut self.entries[index];
         let steps = steps(&entry.config);
         let key = entry.first_key();
         let mut config = entry.config.clone();
@@ -1019,6 +1027,57 @@ mod tests {
             }
         }
         panic!("no switch");
+    }
+
+    // starts every tunnel, and keeps their names
+    #[derive(Default)]
+    struct StartEngine(Arc<Mutex<Vec<String>>>);
+
+    impl Engine for StartEngine {
+        fn start(
+            &mut self,
+            name: &str,
+            _: &store::Id,
+            config: &Config,
+            endpoints: &[Option<SocketAddr>],
+            _: &Steps,
+        ) -> Result<Box<dyn Tunnel>, String> {
+            self.0.lock().unwrap().push(name.to_string());
+            let script = Arc::new(Mutex::new(Script { endpoint: endpoints[0], ..Script::default() }));
+            Ok(Box::new(ScriptedTunnel(script, config.peers[0].public_key)))
+        }
+    }
+
+    fn on(manager: &Manager) -> Vec<String> {
+        manager.list().into_iter().filter(|info| info.up).map(|info| info.name).collect()
+    }
+
+    #[test]
+    fn one_vpn_at_a_time() {
+        let (mut manager, _) = office();
+        #[allow(clippy::default_constructed_unit_structs)]
+        let home = Entry::new("Home".into(), store::Id::default(), conf::parse(CONFIG).unwrap(), OwnKeys::default());
+        manager.entries.push(home);
+        let started = Arc::new(Mutex::new(Vec::new()));
+        manager.engine = Box::new(StartEngine(started.clone()));
+        assert_eq!(on(&manager), ["Office"]);
+        // Home goes on: Office goes off
+        assert!(manager.up("Home", 1).ok);
+        assert_eq!(on(&manager), ["Home"]);
+        // again: nothing changes, nothing starts again
+        assert!(manager.up("home", 1).ok);
+        assert_eq!(on(&manager), ["Home"]);
+        assert_eq!(*started.lock().unwrap(), ["Home"]);
+        // and back
+        assert!(manager.up("Office", 1).ok);
+        assert_eq!(on(&manager), ["Office"]);
+        // a VPN that doesn't exist turns nothing off
+        assert!(!manager.up("Lab", 1).ok);
+        assert_eq!(on(&manager), ["Office"]);
+        // one that can't start: the other is off anyway, as when it starts
+        manager.engine = Box::new(NoEngine);
+        assert!(!manager.up("Home", 1).ok);
+        assert!(on(&manager).is_empty());
     }
 
     #[test]

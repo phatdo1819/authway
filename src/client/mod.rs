@@ -105,6 +105,8 @@ pub struct Tunnel {
     pub unreachable_since: Option<Instant>,
     // the routes of after the login asked on or off to the service, not answered yet
     pub routes_asked: Option<bool>,
+    // the VPNs that go off as this one goes on, see App::others_off
+    pub switched_off: Vec<String>,
 }
 
 impl Tunnel {
@@ -137,6 +139,7 @@ impl Tunnel {
             error: None,
             unreachable_since: None,
             routes_asked: None,
+            switched_off: Vec::new(),
         }
     }
 
@@ -579,6 +582,10 @@ pub struct App<S: Shell> {
     exiting: bool,
     pending_connect: Option<String>,
     startup: Option<Startup>,
+    // the VPN to turn on again at the next start, see settings::reconnect
+    reconnect: Option<String>,
+    // not done yet: at the first list of a running service, which may start after the app
+    reconnect_pending: bool,
 }
 
 pub fn error_message(result: &ApiResult) -> String {
@@ -646,6 +653,9 @@ impl<S: Shell> App<S> {
             exiting: false,
             pending_connect: None,
             startup: Some(startup),
+            // the tests never read the settings of this computer
+            reconnect: if cfg!(test) { None } else { settings::reconnect() },
+            reconnect_pending: true,
         }
     }
 
@@ -867,6 +877,48 @@ impl<S: Shell> App<S> {
         if let Some(name) = self.pending_connect.take() {
             self.connect(&name);
         }
+        if self.reconnect_pending && self.service == ServiceState::Running {
+            self.reconnect_pending = false;
+            self.reconnect_at_start();
+        }
+    }
+
+    // The VPN that was on when the last session ended, with a restart or a sign-out: on again, as it was left. Not
+    // when one is on already: the service kept it, or the user chose
+    fn reconnect_at_start(&mut self) {
+        let Some(name) = self.reconnect.clone() else { return };
+        if self.tunnel_index(&name).is_none() {
+            log!("{}: it was on at the end of the last session, but it's gone", name);
+            self.remember(None);
+            return;
+        }
+        if self.tunnels.iter().any(|tunnel| tunnel.info.up || tunnel.connecting() || tunnel.stopping) {
+            return;
+        }
+        log!("{}: on again, as at the end of the last session", name);
+        self.connect(&name);
+    }
+
+    // the VPN to turn on again at the next start, kept in the settings of the user
+    fn remember(&mut self, name: Option<&str>) {
+        if self.reconnect.as_deref() == name {
+            return;
+        }
+        self.reconnect = name.map(str::to_string);
+        if !cfg!(test) {
+            settings::set_reconnect(name);
+        }
+    }
+
+    fn forget(&mut self, name: &str) {
+        if self.reconnect.as_deref() == Some(name) {
+            self.remember(None);
+        }
+    }
+
+    // the user quits the app: the VPNs go off, and stay off at the next start
+    pub fn forget_reconnect(&mut self) {
+        self.remember(None);
     }
 
     // The first list: what to show, depending on who started the app
@@ -958,7 +1010,10 @@ impl<S: Shell> App<S> {
         let window = self.window_index(name);
         let tunnel = &mut self.tunnels[index];
         tunnel.connecting_since = None;
-        match outcome(&result) {
+        let answer = outcome(&result);
+        self.settle_switched(index, answer.is_ok());
+        let tunnel = &mut self.tunnels[index];
+        match answer {
             Ok(()) => {
                 log!("{}: on", name);
                 tunnel.info.up = true;
@@ -970,6 +1025,8 @@ impl<S: Shell> App<S> {
                 self.next_list = now;
                 if abandon {
                     self.disconnect(name);
+                } else {
+                    self.remember(Some(name));
                 }
             }
             Err(message) => {
@@ -1256,7 +1313,9 @@ impl<S: Shell> App<S> {
 
     fn start_up(&mut self, index: usize) {
         let now = Instant::now();
+        let (switched_off, logouts) = self.others_off(index, now);
         let tunnel = &mut self.tunnels[index];
+        tunnel.switched_off = switched_off;
         tunnel.connecting_since = Some(now);
         tunnel.abandon = false;
         tunnel.error = None;
@@ -1265,10 +1324,68 @@ impl<S: Shell> App<S> {
         log!("{}: connecting", name);
         self.next_list = now + LIST_ACTIVE;
         self.spawn(move || {
+            // through their tunnels, before the service turns them off
+            for (other, page, interface) in logouts {
+                let result = api::logout(&page, interface, Some(LOGOUT_TIMEOUT));
+                if result.status != 200 {
+                    log!("{}: can't log out: {}", other, result);
+                }
+            }
             let result = ipc::call(&Request::Up { name: name.clone() });
             Event::Up { name, result }
         });
         self.update_icon();
+    }
+
+    // One VPN at a time: the service turns the others off when this one goes on. The ones that are on disconnect
+    // here, without a notice, and give their logouts, so their sessions on the firewall end at once; the ones that
+    // are connecting go off again once they're on.
+    fn others_off(&mut self, index: usize, now: Instant) -> (Vec<String>, Vec<(String, Page, u32)>) {
+        let mut logouts = Vec::new();
+        let mut closed = Vec::new();
+        let mut windows = Vec::new();
+        for (other, tunnel) in self.tunnels.iter_mut().enumerate() {
+            if other == index || tunnel.stopping {
+                continue;
+            }
+            if tunnel.connecting() {
+                log!("{}: off once it's on, another VPN goes on", tunnel.name());
+                tunnel.abandon = true;
+                windows.push(tunnel.info.name.clone());
+            } else if tunnel.info.up {
+                log!("{}: disconnecting, another VPN goes on", tunnel.name());
+                tunnel.stopping = true;
+                tunnel.changed_at = now;
+                if let Some((page, interface)) = tunnel.session_page() {
+                    logouts.push((tunnel.info.name.clone(), page, interface));
+                }
+                closed.push(tunnel.info.name.clone());
+            }
+        }
+        for name in closed.iter().chain(&windows) {
+            self.close_window(name);
+        }
+        (closed, logouts)
+    }
+
+    // The answer to the VPN that went on: the service turned the others off, unless it didn't get there. Then the
+    // next list says what they are.
+    fn settle_switched(&mut self, index: usize, on: bool) {
+        let now = Instant::now();
+        for name in std::mem::take(&mut self.tunnels[index].switched_off) {
+            let Some(other) = self.tunnel_index(&name) else { continue };
+            let tunnel = &mut self.tunnels[other];
+            if !tunnel.stopping {
+                continue;
+            }
+            tunnel.stopping = false;
+            if on {
+                log!("{}: off", name);
+                tunnel.info.up = false;
+                tunnel.changed_at = now;
+                tunnel.set_off();
+            }
+        }
     }
 
     // Another device is enrolled for this configuration: off at once, before any login, and it stays off. Its
@@ -1287,12 +1404,15 @@ impl<S: Shell> App<S> {
             }
             None => self.notify(strings::ERROR_OTHER_DEVICE, true, Some(&name)),
         }
+        self.forget(&name);
         self.take_down(&name);
     }
 
-    // with the logout first, so the session of the firewall ends at once
+    // with the logout first, so the session of the firewall ends at once. Asked by the user: it stays off at the
+    // next start
     pub fn disconnect(&mut self, name: &str) {
         self.close_window(name);
+        self.forget(name);
         self.take_down(name);
     }
 
@@ -1556,6 +1676,9 @@ impl<S: Shell> App<S> {
         if let Some(index) = self.tunnel_index(name) {
             self.tunnels[index].info.name = new_name.to_string();
         }
+        if self.reconnect.as_deref() == Some(name) {
+            self.remember(Some(new_name));
+        }
         self.list_soon();
     }
 
@@ -1567,6 +1690,7 @@ impl<S: Shell> App<S> {
             self.tunnels.remove(index);
         }
         settings::set_found_page(name, None);
+        self.forget(name);
         self.list_soon();
         self.update_icon();
     }
@@ -1867,6 +1991,151 @@ mod tests {
         // an answer of an earlier connection is dropped
         app.on_status("Office", generation - 1, status(r#"{"authenticated":true,"user":"alice"}"#));
         assert_eq!(app.tunnels[0].session, Session::NoOtp);
+    }
+
+    // Office on and logged in, Home off, routing all the traffic
+    fn office_and_home(app: &mut App<FakeShell>) {
+        let office = TunnelInfo {
+            name: "Office".into(),
+            up: true,
+            login: Some("http://10.103.1.1:8181/".into()),
+            routes: vec!["10.103.1.0/24".into()],
+            interface: 7,
+            since: unix_now(),
+            ..TunnelInfo::default()
+        };
+        let home = TunnelInfo { name: "Home".into(), routes: vec!["0.0.0.0/0".into()], ..TunnelInfo::default() };
+        let response = Response { ok: true, tunnels: vec![home, office], can_manage: true, ..Response::default() };
+        app.on_list(Instant::now(), Ok(response));
+        let office = app.tunnel_index("Office").unwrap();
+        let generation = app.tunnels[office].generation;
+        app.on_status("Office", generation, status(r#"{"authenticated":true,"otp_required":false,"user":"alice"}"#));
+        assert_eq!(app.tunnels[office].session, Session::LoggedIn);
+    }
+
+    #[test]
+    fn one_vpn_at_a_time() {
+        let (mut app, _) = app();
+        office_and_home(&mut app);
+        let (office, home) = (app.tunnel_index("Office").unwrap(), app.tunnel_index("Home").unwrap());
+        // the work of Home, not run by the tests, logs out of Office first
+        let (closed, logouts) = app.others_off(home, Instant::now());
+        assert_eq!(closed, ["Office"]);
+        assert_eq!(logouts, [("Office".to_string(), Page::parse("http://10.103.1.1:8181/").unwrap(), 7)]);
+
+        // Home goes on: Office disconnects
+        let (mut app, journal) = self::app();
+        office_and_home(&mut app);
+        app.connect("Home");
+        assert!(app.tunnels[home].connecting());
+        assert!(app.tunnels[office].stopping);
+        assert_eq!(app.tunnels[office].describe(), strings::STATE_DISCONNECTING);
+        assert_eq!(app.tunnels[home].switched_off, ["Office"]);
+        // the service says Home is on: Office is off, without a notice
+        app.on_up("Home", Ok(Response::success()));
+        assert!(app.tunnels[home].info.up);
+        let tunnel = &app.tunnels[office];
+        assert!(!tunnel.info.up && !tunnel.stopping);
+        assert_eq!(tunnel.session, Session::Off);
+        assert!(app.tunnels[home].switched_off.is_empty());
+        let disconnected = strings::notice_disconnected(&app.tunnels[office].title());
+        assert!(!journal.borrow().iter().any(|line| line.contains(&disconnected)), "{:?}", journal.borrow());
+        // nor once the list says it
+        let lists = vec![
+            TunnelInfo { name: "Home".into(), up: true, routes: vec!["0.0.0.0/0".into()], ..TunnelInfo::default() },
+            TunnelInfo { name: "Office".into(), routes: vec!["10.103.1.0/24".into()], ..TunnelInfo::default() },
+        ];
+        app.on_list(Instant::now(), Ok(Response { ok: true, tunnels: lists, can_manage: true, ..Response::default() }));
+        assert!(!journal.borrow().iter().any(|line| line.contains(&disconnected)), "{:?}", journal.borrow());
+
+        // the service didn't turn Home on, or never got the request: Office isn't left disconnecting, the list says
+        let (mut app, _) = self::app();
+        office_and_home(&mut app);
+        app.connect("Home");
+        app.on_up("Home", Ok(Response::failure(ipc::NOT_FOUND, "There's no VPN named Home.")));
+        assert!(!app.tunnels[office].stopping);
+        assert!(app.tunnels[office].info.up);
+
+        // Office still connecting: off once it's on
+        let (mut app, _) = self::app();
+        office_and_home(&mut app);
+        app.disconnect("Office");
+        app.on_down("Office", Ok(Response::success()));
+        app.connect("Office");
+        assert!(app.tunnels[office].connecting());
+        app.connect("Home");
+        assert!(app.tunnels[office].abandon);
+        assert!(app.tunnels[home].switched_off.is_empty());
+        app.on_up("Office", Ok(Response::success()));
+        assert!(app.tunnels[office].stopping);
+    }
+
+    fn list(app: &mut App<FakeShell>, tunnels: Vec<TunnelInfo>) {
+        app.on_list(Instant::now(), Ok(Response { ok: true, tunnels, can_manage: true, ..Response::default() }));
+    }
+
+    fn off(name: &str) -> TunnelInfo {
+        TunnelInfo { name: name.into(), routes: vec!["0.0.0.0/0".into()], ..TunnelInfo::default() }
+    }
+
+    #[test]
+    fn on_again_after_a_restart() {
+        // on: remembered; off by the user: forgotten
+        let (mut app, _) = app();
+        list(&mut app, vec![off("Home"), off("Authway test")]);
+        app.connect("Home");
+        assert_eq!(app.reconnect, None);
+        app.on_up("Home", Ok(Response::success()));
+        assert_eq!(app.reconnect.as_deref(), Some("Home"));
+        app.disconnect("Home");
+        assert_eq!(app.reconnect, None);
+        // another one on: it's the one now
+        app.on_down("Home", Ok(Response::success()));
+        app.connect("Home");
+        app.on_up("Home", Ok(Response::success()));
+        app.connect("Authway test");
+        app.on_up("Authway test", Ok(Response::success()));
+        assert_eq!(app.reconnect.as_deref(), Some("Authway test"));
+        // the session ends: the service turns it off, the app doesn't forget it
+        list(&mut app, vec![off("Home"), off("Authway test")]);
+        assert_eq!(app.reconnect.as_deref(), Some("Authway test"));
+        // renamed, removed: names nobody has, they read and delete the settings of this computer
+        app.renamed("Authway test", "Authway test 2");
+        assert_eq!(app.reconnect.as_deref(), Some("Authway test 2"));
+        app.removed("Authway test 2");
+        assert_eq!(app.reconnect, None);
+        // quit by the user
+        app.remember(Some("Home"));
+        app.forget_reconnect();
+        assert_eq!(app.reconnect, None);
+
+        // the next start: on again once the service runs, which may start after the app
+        let (mut app, _) = self::app();
+        app.reconnect = Some("Home".into());
+        app.on_list(Instant::now(), Err(CallError::Unavailable));
+        assert!(app.reconnect_pending);
+        list(&mut app, vec![off("Home"), off("Authway test")]);
+        assert!(!app.reconnect_pending);
+        assert!(app.tunnels[app.tunnel_index("Home").unwrap()].connecting());
+        assert!(!app.tunnels[app.tunnel_index("Authway test").unwrap()].connecting());
+        // once only
+        app.on_up("Home", Err(CallError::Unavailable));
+        list(&mut app, vec![off("Home"), off("Authway test")]);
+        assert!(!app.tunnels[app.tunnel_index("Home").unwrap()].connecting());
+
+        // one is on already: the service kept it, nothing changes
+        let (mut app, _) = self::app();
+        app.reconnect = Some("Home".into());
+        list(&mut app, vec![off("Home"), TunnelInfo { up: true, interface: 7, ..off("Authway test") }]);
+        assert!(!app.tunnels[app.tunnel_index("Home").unwrap()].connecting());
+        assert_eq!(app.reconnect.as_deref(), Some("Home"));
+
+        // gone since: forgotten
+        let (mut app, _) = self::app();
+        app.reconnect = Some("Old".into());
+        list(&mut app, vec![off("Home")]);
+        assert_eq!(app.reconnect, None);
+        assert!(!app.tunnels[0].connecting());
     }
 
     #[test]

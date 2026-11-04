@@ -41,6 +41,11 @@ The packages are in the [releases](https://github.com/phatdo1819/authway/release
 
 ## What to expect
 
+- **One VPN at a time**: turning a VPN on turns off the one that was on, after logging it out. Two VPNs would take
+  the same routes, and one of them would carry nothing while it says it's connected.
+- **After a restart**: the VPN that was on when the computer restarted, or when you signed out, turns on again when
+  you sign in, with the login window when the server asks for one. Turning it off, or quitting Authway, forgets it:
+  it then stays off.
 - **When the session ends** (it expired, or the computer changed network), the login window opens again with the
   saved password: only the code is needed. **Cancel** or **Disconnect** logs out and turns the tunnel off. Quitting
   the app turns all the tunnels off.

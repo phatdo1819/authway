@@ -87,6 +87,27 @@ pub fn set_window_place(place: [i32; 4]) {
     }
 }
 
+// The VPN that was on when the session of the user ended, with a restart or a sign-out: the app turns it on again at
+// its next start. The user turning it off, or quitting the app, forgets it
+pub fn reconnect() -> Option<String> {
+    Key::open(reg::HKEY_CURRENT_USER, &names::user_key())?.get_string("Reconnect").filter(|name| !name.is_empty())
+}
+
+pub fn set_reconnect(tunnel: Option<&str>) {
+    match tunnel {
+        Some(tunnel) => {
+            if let Ok(key) = Key::create(reg::HKEY_CURRENT_USER, &names::user_key()) {
+                let _ = key.set_string("Reconnect", tunnel);
+            }
+        }
+        None => {
+            if let Some(key) = Key::open_writable(reg::HKEY_CURRENT_USER, &names::user_key()) {
+                key.delete_value("Reconnect");
+            }
+        }
+    }
+}
+
 pub fn delete_user_settings() {
     let _ = reg::delete_tree(reg::HKEY_CURRENT_USER, &names::user_key());
 }

@@ -364,11 +364,15 @@ pub fn remove_command(name: &str) -> i32 {
     }
 }
 
-// The tunnels go off with the app: nobody would watch their session anymore
-pub fn quit(confirm: bool) {
+// The tunnels go off with the app: nobody would watch their session anymore. Quit by the user, after a confirmation,
+// they stay off at the next start; quit by the setup, they come back on with the app
+pub fn quit(by_user: bool) {
     let active = with_app(|app| app.active_tunnels()).unwrap_or_default();
-    if confirm && !active.is_empty() && message_box(ptr::null_mut(), &strings::quit_confirm(), MB_YESNO | MB_ICONQUESTION) != IDYES {
+    if by_user && !active.is_empty() && message_box(ptr::null_mut(), &strings::quit_confirm(), MB_YESNO | MB_ICONQUESTION) != IDYES {
         return;
+    }
+    if by_user {
+        with_app(|app| app.forget_reconnect());
     }
     for (name, session_page) in active {
         if let Some((page, interface)) = session_page {

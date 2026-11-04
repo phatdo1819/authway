@@ -314,13 +314,17 @@ pub fn stop_tunnels() {
     super::shutdown();
 }
 
-pub fn quit(mtm: MainThreadMarker, confirm: bool) {
+// Quit by the user, after a confirmation: the tunnels stay off at the next start. At the logout they come back on
+pub fn quit(mtm: MainThreadMarker, by_user: bool) {
     let active = with_app(|app| app.active_tunnels()).unwrap_or_default();
-    if confirm
+    if by_user
         && !active.is_empty()
         && alert(mtm, &strings::quit_confirm(), None, NSAlertStyle::Warning, &[strings::MENU_QUIT, strings::CANCEL]) != 0
     {
         return;
+    }
+    if by_user {
+        with_app(|app| app.forget_reconnect());
     }
     stop_tunnels();
     NSApplication::sharedApplication(mtm).terminate(None);

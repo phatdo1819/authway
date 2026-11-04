@@ -91,6 +91,9 @@ struct UserSettings {
     open_at_sign_in: Option<bool>,
     #[serde(default)]
     close_notice_shown: bool,
+    // the VPN that was on when the session ended, see reconnect()
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reconnect: Option<String>,
 }
 
 fn user_file() -> PathBuf {
@@ -170,6 +173,21 @@ pub fn close_notice_shown() -> bool {
 pub fn set_close_notice_shown() {
     let mut settings = load();
     settings.close_notice_shown = true;
+    store(&settings);
+}
+
+// The VPN that was on when the session of the user ended, with a restart or a logout: the app turns it on again at
+// its next start. The user turning it off, or quitting the app, forgets it
+pub fn reconnect() -> Option<String> {
+    load().reconnect.filter(|name| !name.is_empty())
+}
+
+pub fn set_reconnect(tunnel: Option<&str>) {
+    let mut settings = load();
+    if settings.reconnect.as_deref() == tunnel {
+        return;
+    }
+    settings.reconnect = tunnel.map(str::to_string);
     store(&settings);
 }
 
