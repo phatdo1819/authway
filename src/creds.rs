@@ -11,6 +11,7 @@ use windows_sys::Win32::Security::Credentials::{
 
 use crate::api::Page;
 use crate::names;
+use crate::secret::Secret;
 use crate::win::{from_wide_ptr, wide};
 
 // for the log
@@ -20,7 +21,7 @@ pub const STORE_NAME: &str = "the Credential Manager";
 pub struct SavedLogin {
     pub username: String,
     // None when the user didn't want it saved
-    pub password: Option<String>,
+    pub password: Option<Secret>,
 }
 
 // "Authway/http://10.103.1.1:8181", as the Credential Manager shows it
@@ -37,7 +38,7 @@ pub fn read(page: &Page) -> SavedLogin {
         let item = &*credential;
         let password = if item.CredentialBlobSize >= 2 && !item.CredentialBlob.is_null() {
             let text = std::slice::from_raw_parts(item.CredentialBlob as *const u16, item.CredentialBlobSize as usize / 2);
-            Some(String::from_utf16_lossy(text))
+            Some(Secret::from(String::from_utf16_lossy(text)))
         } else {
             None
         };

@@ -407,7 +407,7 @@ impl ConnectWindow {
         let checked = unsafe { SendMessageW(self.remember, BM_GETCHECK, 0, 0) } as u32 == BST_CHECKED;
         LoginValues {
             username: get_text(self.username).trim().to_string(),
-            password: get_text(self.password),
+            password: get_text(self.password).into(),
             code: get_text(self.code),
             remember: self.can_remember && checked,
         }

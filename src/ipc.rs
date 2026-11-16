@@ -71,6 +71,8 @@ pub const NOT_FOUND: &str = "not_found";
 pub const EXISTS: &str = "exists";
 pub const INVALID: &str = "invalid";
 pub const FAILED: &str = "failed";
+// another user of the computer has a VPN on
+pub const IN_USE: &str = "in_use";
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct Response {
@@ -137,6 +139,9 @@ pub struct TunnelInfo {
     // while it's on: the app said the user logged in, the routes and the DNS servers of after the login are on
     #[serde(default)]
     pub logged_in: bool,
+    // while it's on: another user of the computer turned it on, its login is theirs
+    #[serde(default)]
+    pub other_user: bool,
     // the index of the network adapter of the tunnel while it's on, 0 else: the requests to the login page go out
     // only through it
     #[serde(default)]

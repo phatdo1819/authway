@@ -21,6 +21,8 @@ pub const POLL: Duration = Duration::from_secs(1);
 pub const SILENCE: Duration = Duration::from_secs(20);
 // for a name, during a change of address: the DNS servers may be the ones of the tunnel that doesn't answer
 pub const LOOKUP_TIME: Duration = Duration::from_secs(5);
+// for a name, when the tunnel turns on: the DNS servers of the network, a captive portal maybe
+pub const CONNECT_LOOKUP_TIME: Duration = Duration::from_secs(10);
 
 // A keepalive is the only message of WireGuard that gets no answer: 32 bytes, and two can go in one poll. Any other
 // is longer or not a multiple of 32: the initiation of a handshake is 148 bytes, data at least 64.
@@ -84,17 +86,34 @@ pub fn resolve(endpoint: &Endpoint) -> Result<SocketAddr, String> {
         .ok_or_else(|| format!("Can't find the server {}.", endpoint.host))
 }
 
-// resolve, or None after the time given: the lookup goes on alone
-pub fn lookup(endpoint: &Endpoint, time: Duration) -> Option<SocketAddr> {
-    if let Ok(ip) = endpoint.host.parse::<IpAddr>() {
-        return Some(SocketAddr::new(ip, endpoint.port));
-    }
+// The result of the work, or None after the time given: the work goes on alone, its result is dropped
+fn within<T: Send + 'static>(time: Duration, work: impl FnOnce() -> T + Send + 'static) -> Option<T> {
     let (sender, receiver) = mpsc::channel();
-    let endpoint = endpoint.clone();
     thread::spawn(move || {
-        let _ = sender.send(resolve(&endpoint));
+        let _ = sender.send(work());
     });
-    receiver.recv_timeout(time).ok().and_then(Result::ok)
+    receiver.recv_timeout(time).ok()
+}
+
+// The address of an endpoint that is an IP: no lookup
+fn literal(endpoint: &Endpoint) -> Option<SocketAddr> {
+    endpoint.host.parse::<IpAddr>().ok().map(|ip| SocketAddr::new(ip, endpoint.port))
+}
+
+// resolve, or an error after the time given: a lookup can wait for long on a network without DNS
+pub fn resolve_within(endpoint: &Endpoint, time: Duration) -> Result<SocketAddr, String> {
+    if let Some(address) = literal(endpoint) {
+        return Ok(address);
+    }
+    let target = endpoint.clone();
+    within(time, move || resolve(&target)).unwrap_or_else(|| {
+        Err(format!("Can't find the server {}: no answer in {} seconds.", endpoint.host, time.as_secs()))
+    })
+}
+
+// resolve, or None after the time given
+pub fn lookup(endpoint: &Endpoint, time: Duration) -> Option<SocketAddr> {
+    resolve_within(endpoint, time).ok()
 }
 
 // The addresses of one server of a tunnel that is on, and the one in use
@@ -121,16 +140,42 @@ pub struct Next {
 }
 
 impl Failover {
-    // At the connection: the first address that can be found, the others too when they can, for later. None for a
-    // server without an Endpoint, that this computer never sends to first.
-    pub fn start(peer: &Peer) -> Result<Option<Failover>, String> {
+    // At the connection: the first address that can be found, in order, each name within the time given. The names
+    // after it are looked up only when the tunnel moves to them; the IPs are known at once. None for a server
+    // without an Endpoint, that this computer never sends to first.
+    pub fn start(peer: &Peer, time: Duration) -> Result<Option<Failover>, String> {
+        Failover::start_with(peer, |endpoint| resolve_within(endpoint, time))
+    }
+
+    fn start_with(
+        peer: &Peer,
+        mut find: impl FnMut(&Endpoint) -> Result<SocketAddr, String>,
+    ) -> Result<Option<Failover>, String> {
         let Some(endpoint) = &peer.endpoint else { return Ok(None) };
         let endpoints: Vec<Endpoint> = std::iter::once(endpoint).chain(&peer.fallbacks).cloned().collect();
-        let results: Vec<Result<SocketAddr, String>> = endpoints.iter().map(resolve).collect();
-        let Some(current) = results.iter().position(Result::is_ok) else {
-            return Err(results.into_iter().next().and_then(Result::err).unwrap_or_default());
-        };
-        Ok(Some(Failover::new(endpoints, results.into_iter().map(Result::ok).collect(), current)))
+        let mut addresses: Vec<Option<SocketAddr>> = endpoints.iter().map(literal).collect();
+        let mut first_error = None;
+        let mut current = None;
+        for (index, endpoint) in endpoints.iter().enumerate() {
+            let found = match addresses[index] {
+                Some(address) => Ok(address),
+                None => find(endpoint),
+            };
+            match found {
+                Ok(address) => {
+                    addresses[index] = Some(address);
+                    current = Some(index);
+                    break;
+                }
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        match current {
+            Some(current) => Ok(Some(Failover::new(endpoints, addresses, current))),
+            None => Err(first_error.unwrap_or_default()),
+        }
     }
 
     fn new(endpoints: Vec<Endpoint>, addresses: Vec<Option<SocketAddr>>, current: usize) -> Failover {
@@ -366,9 +411,8 @@ mod tests {
         assert_eq!(failover.address(), "203.0.113.9:51820".parse().unwrap());
     }
 
-    #[test]
-    fn at_the_connection() {
-        let peer = |endpoint: &str, fallbacks: &[&str]| Peer {
+    fn peer(endpoint: &str, fallbacks: &[&str]) -> Peer {
+        Peer {
             public_key: [0; 32],
             preshared_key: None,
             allowed_ips: Vec::new(),
@@ -376,15 +420,73 @@ mod tests {
             fallbacks: endpoints(fallbacks),
             keepalive: 25,
             name: None,
-        };
-        let failover = Failover::start(&peer("192.0.2.1:51820", &["192.0.2.2:51820"])).unwrap().unwrap();
+        }
+    }
+
+    #[test]
+    fn at_the_connection() {
+        let time = CONNECT_LOOKUP_TIME;
+        let failover = Failover::start(&peer("192.0.2.1:51820", &["192.0.2.2:51820"]), time).unwrap().unwrap();
         assert_eq!((failover.index(), failover.address()), (0, "192.0.2.1:51820".parse().unwrap()));
         // the Endpoint can't be found: the first fallback that can
-        let failover = Failover::start(&peer("nowhere.invalid:51820", &["nowhere2.invalid:1", "192.0.2.2:51820"])).unwrap();
+        let failover = Failover::start(&peer("nowhere.invalid:51820", &["nowhere2.invalid:1", "192.0.2.2:51820"]), time).unwrap();
         assert_eq!(failover.map(|failover| failover.index()), Some(2));
         // none: the error of the Endpoint
-        let error = Failover::start(&peer("nowhere.invalid:51820", &["nowhere2.invalid:1"])).err().unwrap();
+        let error = Failover::start(&peer("nowhere.invalid:51820", &["nowhere2.invalid:1"]), time).err().unwrap();
         assert!(error.starts_with("Can't find the server nowhere.invalid"), "{}", error);
-        assert!(Failover::start(&peer("", &[])).unwrap().is_none());
+        assert!(Failover::start(&peer("", &[]), time).unwrap().is_none());
+    }
+
+    // The names found at the connection, in order: until the first one found, never the ones after it
+    #[test]
+    fn only_the_lookups_needed() {
+        let found = |answers: &[(&str, Option<&str>)]| {
+            let answers: Vec<(String, Option<SocketAddr>)> =
+                answers.iter().map(|(host, address)| (host.to_string(), address.map(|text| text.parse().unwrap()))).collect();
+            let asked = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let journal = asked.clone();
+            let find = move |endpoint: &Endpoint| {
+                journal.borrow_mut().push(endpoint.host.clone());
+                let answer = answers.iter().find(|(host, _)| *host == endpoint.host).and_then(|(_, address)| *address);
+                answer.ok_or_else(|| format!("Can't find the server {}.", endpoint.host))
+            };
+            (find, asked)
+        };
+
+        // the Endpoint is found: the names of the fallbacks wait until the tunnel moves to them, the IPs are known
+        let (find, asked) = found(&[("vpn.example.com", Some("203.0.113.1:51820"))]);
+        let first = peer("vpn.example.com:51820", &["vpn2.example.com:51820", "203.0.113.3:51821"]);
+        let failover = Failover::start_with(&first, find).unwrap().unwrap();
+        assert_eq!(*asked.borrow(), ["vpn.example.com"]);
+        assert_eq!(failover.addresses, [address("203.0.113.1:51820"), None, address("203.0.113.3:51821")]);
+
+        // the Endpoint can't be found: the next name, and no more
+        let (find, asked) = found(&[("vpn2.example.com", Some("198.51.100.2:51820"))]);
+        let second = peer("vpn.example.com:51820", &["vpn2.example.com:51820", "vpn3.example.com:51820"]);
+        let failover = Failover::start_with(&second, find).unwrap().unwrap();
+        assert_eq!(*asked.borrow(), ["vpn.example.com", "vpn2.example.com"]);
+        assert_eq!((failover.index(), failover.address()), (1, "198.51.100.2:51820".parse().unwrap()));
+
+        // an IP before the names: no lookup at all
+        let (find, asked) = found(&[]);
+        let failover = Failover::start_with(&peer("203.0.113.1:51820", &["vpn2.example.com:51820"]), find).unwrap().unwrap();
+        assert!(asked.borrow().is_empty());
+        assert_eq!(failover.index(), 0);
+    }
+
+    // A lookup that doesn't end in time: an error, without waiting for it
+    #[test]
+    fn a_lookup_that_takes_too_long() {
+        let started = Instant::now();
+        let answer = within(Duration::from_millis(50), || {
+            thread::sleep(Duration::from_secs(5));
+            1
+        });
+        assert_eq!(answer, None);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(within(Duration::from_secs(5), || 2), Some(2));
+        // an IP never waits
+        let endpoint = Endpoint::parse("203.0.113.1:51820").unwrap();
+        assert_eq!(resolve_within(&endpoint, Duration::ZERO), Ok("203.0.113.1:51820".parse().unwrap()));
     }
 }

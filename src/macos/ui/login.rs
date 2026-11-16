@@ -342,7 +342,7 @@ impl LoginView for LoginWindow {
     fn values(&self) -> LoginValues {
         LoginValues {
             username: self.username.stringValue().to_string().trim().to_string(),
-            password: self.password.stringValue().to_string(),
+            password: self.password.stringValue().to_string().into(),
             code: self.code.stringValue().to_string(),
             remember: self.can_remember && self.remember.state() == NSControlStateValueOn,
         }

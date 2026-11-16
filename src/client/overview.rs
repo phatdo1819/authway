@@ -139,7 +139,7 @@ fn tone(tunnel: &Tunnel) -> Tone {
     if tunnel.no_answer() {
         return Tone::Warning;
     }
-    if tunnel.page.is_none() {
+    if tunnel.page.is_none() || tunnel.info.other_user {
         return if tunnel.info.handshake > 0 { Tone::Good } else { Tone::Busy };
     }
     match tunnel.session {

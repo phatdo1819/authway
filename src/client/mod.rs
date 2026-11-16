@@ -18,6 +18,7 @@ use crate::creds::{self, SavedLogin};
 use crate::ipc::{self, CallError, Request, Response, TunnelInfo};
 use crate::log;
 use crate::names::{PRODUCT, VERSION};
+use crate::secret::Secret;
 use crate::settings;
 use crate::strings;
 use crate::time::{self, unix_now};
@@ -266,6 +267,10 @@ impl Tunnel {
             }
             .to_string();
         }
+        // its login and its session are theirs: this app never looks at them
+        if self.info.other_user {
+            return strings::STATE_OTHER_USER.to_string();
+        }
         if self.no_answer() {
             return strings::STATE_NO_ANSWER.to_string();
         }
@@ -296,7 +301,7 @@ impl Tunnel {
         if self.no_answer() {
             return Icon::Attention;
         }
-        if self.page.is_none() {
+        if self.page.is_none() || self.info.other_user {
             return if self.info.handshake > 0 { Icon::Connected } else { Icon::Attention };
         }
         match self.session {
@@ -415,7 +420,7 @@ pub enum Event {
     Up { name: String, result: Result<Response, CallError> },
     Down { name: String, result: Result<Response, CallError> },
     Status { name: String, generation: u32, result: ApiResult },
-    Login { name: String, generation: u32, result: ApiResult, username: String, password: String, remember: bool },
+    Login { name: String, generation: u32, result: ApiResult, username: String, password: Secret, remember: bool },
     Found { name: String, generation: u32, page: Option<Page> },
     LoggedIn { name: String, logged_in: bool, result: Result<Response, CallError> },
     OwnKey { name: String, result: Result<(), String> },
@@ -481,7 +486,7 @@ pub enum ServiceState {
 
 pub struct LoginValues {
     pub username: String,
-    pub password: String,
+    pub password: Secret,
     pub code: String,
     pub remember: bool,
 }
@@ -793,7 +798,8 @@ impl<S: Shell> App<S> {
         let mut searches = Vec::new();
         let mut announce = Vec::new();
         for tunnel in &mut self.tunnels {
-            if !tunnel.info.up || tunnel.stopping {
+            // the login page of a VPN that another user turned on is theirs
+            if !tunnel.info.up || tunnel.stopping || tunnel.info.other_user {
                 continue;
             }
             // the login page only through the network interface of the tunnel: once the service has listed it
@@ -1229,7 +1235,7 @@ impl<S: Shell> App<S> {
     fn sync_routes(&mut self, name: &str) {
         let Some(index) = self.tunnel_index(name) else { return };
         let tunnel = &mut self.tunnels[index];
-        if tunnel.info.login.is_none() || tunnel.page.is_none() || !tunnel.info.up || tunnel.stopping {
+        if tunnel.info.login.is_none() || tunnel.page.is_none() || !tunnel.info.up || tunnel.stopping || tunnel.info.other_user {
             return;
         }
         let Some(wanted) = tunnel.wants_after_login(Instant::now()) else { return };
@@ -1293,7 +1299,8 @@ impl<S: Shell> App<S> {
             return;
         }
         if tunnel.info.up {
-            if tunnel.page.is_some() && tunnel.session != Session::LoggedIn && tunnel.session != Session::NotRequired {
+            let own = !tunnel.info.other_user;
+            if own && tunnel.page.is_some() && tunnel.session != Session::LoggedIn && tunnel.session != Session::NotRequired {
                 self.show_login(name, None);
             }
             return;
@@ -1548,7 +1555,7 @@ impl<S: Shell> App<S> {
         });
     }
 
-    fn on_login(&mut self, name: &str, generation: u32, result: ApiResult, username: &str, password: String, remember: bool) {
+    fn on_login(&mut self, name: &str, generation: u32, result: ApiResult, username: &str, password: Secret, remember: bool) {
         let Some(index) = self.tunnel_index(name) else { return };
         let window = self.window_index(name);
         let now = Instant::now();
@@ -1695,11 +1702,12 @@ impl<S: Shell> App<S> {
         self.update_icon();
     }
 
-    // the tunnels to turn off when the app quits, with their login page and its interface when logged in
+    // the tunnels to turn off when the app quits, with their login page and its interface when logged in: not the ones
+    // of another user, who still uses them
     pub fn active_tunnels(&self) -> Vec<(String, Option<(Page, u32)>)> {
         self.tunnels
             .iter()
-            .filter(|tunnel| tunnel.info.up || tunnel.connecting())
+            .filter(|tunnel| (tunnel.info.up || tunnel.connecting()) && !tunnel.info.other_user)
             .map(|tunnel| (tunnel.info.name.clone(), tunnel.session_page()))
             .collect()
     }
@@ -1875,7 +1883,7 @@ mod tests {
         }
         fn values(&self) -> LoginValues {
             let (username, password, code) = self.values.clone();
-            LoginValues { username, password, code, remember: false }
+            LoginValues { username, password: password.into(), code, remember: false }
         }
         fn clear_code(&self) {}
         fn code_changed(&self) -> bool {
@@ -2072,6 +2080,47 @@ mod tests {
 
     fn list(app: &mut App<FakeShell>, tunnels: Vec<TunnelInfo>) {
         app.on_list(Instant::now(), Ok(Response { ok: true, tunnels, can_manage: true, ..Response::default() }));
+    }
+
+    // Another user of the computer turned Office on: its login is theirs
+    #[test]
+    fn a_vpn_of_another_user() {
+        let (mut app, journal) = app();
+        let office = TunnelInfo {
+            name: "Office".into(),
+            up: true,
+            other_user: true,
+            login: Some("http://10.103.1.1:8181/".into()),
+            routes: vec!["0.0.0.0/0".into()],
+            after_login: vec!["0.0.0.0/0".into()],
+            interface: 7,
+            since: unix_now(),
+            handshake: unix_now(),
+            ..TunnelInfo::default()
+        };
+        list(&mut app, vec![office.clone()]);
+        assert!(app.tunnels[0].page.is_some());
+        // this app never asks its login page, nor opens the login, nor asks for its routes, nor says it's connected
+        app.tick();
+        let tunnel = &app.tunnels[0];
+        assert!(!tunnel.busy && !tunnel.searched && !tunnel.announced);
+        app.sync_routes("Office");
+        assert_eq!(app.tunnels[0].routes_asked, None);
+        app.connect("Office");
+        assert!(!journal.borrow().iter().any(|line| line.starts_with("login") || line.starts_with("notify")), "{:?}", journal.borrow());
+        // it shows as connected, for someone else
+        assert_eq!(app.tunnels[0].describe(), strings::STATE_OTHER_USER);
+        assert_eq!(app.summary().0, Icon::Connected);
+        assert_eq!(overview::card(&app.tunnels[0]).tone, overview::Tone::Good);
+        assert_eq!(overview::card(&app.tunnels[0]).hint, None);
+        // the app quits: the VPN stays on for its user
+        assert!(app.active_tunnels().is_empty());
+
+        // once it's this user's: its login page, as any other, and off when the app quits
+        list(&mut app, vec![TunnelInfo { other_user: false, ..office }]);
+        app.tick();
+        assert!(app.tunnels[0].busy);
+        assert_eq!(app.active_tunnels(), [("Office".to_string(), None)]);
     }
 
     fn off(name: &str) -> TunnelInfo {

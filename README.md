@@ -93,7 +93,8 @@ See [Building](docs/building.md).
 - No automatic updates: install each new version by hand or with your deployment tool.
 - The VPNs don't reconnect by themselves at sign-in.
 - The VPNs belong to the computer, not to a user: every user of the computer can connect them. The saved passwords
-  stay with each user.
+  stay with each user, and a VPN that is on stays the one of the user who connected it: the others can't log in on
+  it, nor disconnect it unless they can add and remove VPNs.
 - English only.
 - Device binding uses software keys, not the TPM or the Secure Enclave.
 - No iOS or Android app.

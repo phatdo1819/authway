@@ -70,9 +70,7 @@ impl Server {
             (_, Err(error)) => Response::failure(ipc::INVALID, error),
             (Some(uid), Ok(request)) => {
                 self.seen.lock().unwrap_or_else(|error| error.into_inner()).insert(uid, Instant::now());
-                let client = client_of(uid);
-                let mut manager = self.manager.lock().unwrap_or_else(|error| error.into_inner());
-                manager.handle(request, &client)
+                manager::handle(&self.manager, request, &client_of(uid))
             }
         };
         if let Err(error) = ipc::write_to(&mut stream, &response) {
@@ -176,8 +174,9 @@ fn serve(started: &str) -> i32 {
     let signals = block_signals();
     log::init(log_path());
     log!("{} {}: {}", names::PRODUCT, names::VERSION, started);
-    // the DNS servers of a service that stopped without putting them back
+    // the DNS servers and the routes of the servers of a service that stopped without taking them back
     net::restore_dns_backup();
+    net::restore_host_routes();
     let listener = match bind() {
         Ok(listener) => listener,
         Err(error) => {

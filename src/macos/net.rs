@@ -206,6 +206,37 @@ pub fn restore_dns_backup() {
     let _ = fs::remove_file(backup_file());
 }
 
+// The routes of the servers out of the tunnels, with the tunnel of each, kept in a file until they're taken back: a
+// service that stopped without it takes them back at its next start. The routes of the tunnels go with their
+// interface, these don't.
+static HOST_ROUTES: Mutex<Vec<(u64, plan::HostRoute)>> = Mutex::new(Vec::new());
+
+fn host_routes_file() -> PathBuf {
+    setup::support_dir().join("host-routes.json")
+}
+
+fn keep_host_routes(change: impl FnOnce(&mut Vec<(u64, plan::HostRoute)>)) {
+    let mut routes = HOST_ROUTES.lock().unwrap_or_else(|error| error.into_inner());
+    change(&mut routes);
+    let list: Vec<plan::HostRoute> = routes.iter().map(|(_, route)| route.clone()).collect();
+    if list.is_empty() {
+        let _ = fs::remove_file(host_routes_file());
+    } else if let Err(error) = fs::write(host_routes_file(), plan::host_routes_text(&list)) {
+        log!("can't keep the routes of the servers: {}", error);
+    }
+}
+
+// At the start of the service: the routes of the servers that a service that stopped left behind
+pub fn restore_host_routes() {
+    let Ok(data) = fs::read(host_routes_file()) else { return };
+    for route in plan::parse_host_routes(&data) {
+        if run(ROUTE, &plan::host_route_args(Action::Delete, route.address, &route.gateway)).is_ok() {
+            log!("the route of before to the server {} is gone", route.address);
+        }
+    }
+    let _ = fs::remove_file(host_routes_file());
+}
+
 static NEXT_OWNER: Mutex<u64> = Mutex::new(1);
 
 // What a tunnel changed in the network, taken back when it's dropped
@@ -336,6 +367,8 @@ impl Network {
         // one of before, from a tunnel that went off without taking it back
         let _ = run(ROUTE, &plan::host_route_args(Action::Delete, address, &gateway));
         if run_logged(ROUTE, &plan::host_route_args(Action::Add, address, &gateway)) {
+            let route = plan::HostRoute { address, gateway: gateway.clone() };
+            keep_host_routes(|routes| routes.push((self.owner, route)));
             self.host_routes.push((address, gateway));
         }
     }
@@ -344,6 +377,8 @@ impl Network {
         for (address, gateway) in std::mem::take(&mut self.host_routes) {
             let _ = run(ROUTE, &plan::host_route_args(Action::Delete, address, &gateway));
         }
+        let owner = self.owner;
+        keep_host_routes(|routes| routes.retain(|(other, _)| *other != owner));
     }
 
     // every UPKEEP: another network, another router; the DNS servers again on the services

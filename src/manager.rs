@@ -3,7 +3,7 @@
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use std::thread;
 use std::time::Instant;
 
@@ -14,12 +14,86 @@ use crate::ipc::{self, PeerInfo, Request, Response, TunnelInfo};
 use crate::log;
 use crate::store;
 use crate::time::unix_now;
-use crate::{device, devkey, x25519};
+use crate::{device, x25519};
 
 // seconds of packets sent without a handshake for a new private key: the server may take another one of the tunnel
 const KEY_SILENCE: u64 = 30;
 // the same for a key that worked: longer than WireGuard keeps a session, 180 seconds
 const KEY_LOST: u64 = 200;
+// a configuration replaced while the servers of the tunnel are looked up: they're looked up again, so many times
+const UP_ATTEMPTS: usize = 3;
+
+// The configurations and the device keys on disk. The tests keep them in memory, on the thread of each test, where
+// a test can make the disk refuse
+#[cfg(not(test))]
+mod disk {
+    pub use crate::devkey::{delete as delete_device_key, rename as rename_device_key};
+    pub use crate::store::{delete, rename, save};
+}
+
+#[cfg(test)]
+pub(crate) mod disk {
+    use std::cell::RefCell;
+
+    use crate::store::{Id, Stored};
+
+    #[derive(Default)]
+    pub struct Disk {
+        // the name of each configuration, its first spelling, and its text
+        pub files: Vec<(String, String)>,
+        pub refuse: bool,
+        // what was written, in order
+        pub journal: Vec<String>,
+    }
+
+    thread_local! {
+        pub static DISK: RefCell<Disk> = RefCell::new(Disk::default());
+    }
+
+    fn change(what: String, work: impl FnOnce(&mut Disk)) -> Result<(), String> {
+        DISK.with(|disk| {
+            let mut disk = disk.borrow_mut();
+            if disk.refuse {
+                return Err("the disk is full".to_string());
+            }
+            work(&mut disk);
+            disk.journal.push(what);
+            Ok(())
+        })
+    }
+
+    // as the registry and the file system of macOS: a new case alone keeps the first spelling
+    pub fn save(name: &str, text: &str) -> Result<Stored, String> {
+        change(format!("save {}", name), |disk| {
+            match disk.files.iter_mut().find(|(file, _)| file.eq_ignore_ascii_case(name)) {
+                Some(file) => file.1 = text.to_string(),
+                None => disk.files.push((name.to_string(), text.to_string())),
+            }
+        })?;
+        #[allow(clippy::default_constructed_unit_structs)]
+        Ok(Stored { name: name.to_string(), text: text.to_string(), id: Id::default() })
+    }
+
+    pub fn delete(name: &str) -> Result<(), String> {
+        change(format!("delete {}", name), |disk| disk.files.retain(|(file, _)| !file.eq_ignore_ascii_case(name)))
+    }
+
+    pub fn rename(name: &str, new_name: &str) -> Result<(), String> {
+        change(format!("rename {} {}", name, new_name), |disk| {
+            if let Some(file) = disk.files.iter_mut().find(|(file, _)| file.eq_ignore_ascii_case(name)) {
+                file.0 = new_name.to_string();
+            }
+        })
+    }
+
+    pub fn delete_device_key(tunnel: &str, _id: &Id) {
+        DISK.with(|disk| disk.borrow_mut().journal.push(format!("delete the device key of {}", tunnel)));
+    }
+
+    pub fn rename_device_key(tunnel: &str, new_name: &str, _id: &Id) {
+        DISK.with(|disk| disk.borrow_mut().journal.push(format!("rename the device key of {} {}", tunnel, new_name)));
+    }
+}
 
 // What the tunnel says of a server
 pub struct PeerStats {
@@ -136,6 +210,8 @@ pub struct Switch {
 struct Entry {
     name: String,
     id: store::Id,
+    // of this configuration: another one, imported in its place, has another
+    revision: u64,
     // as in the configuration file
     config: Config,
     // the WireGuard keys this computer made for the server
@@ -145,7 +221,28 @@ struct Entry {
 
 impl Entry {
     fn new(name: String, id: store::Id, config: Config, keys: OwnKeys) -> Entry {
-        Entry { name, id, config, keys, active: None }
+        Entry { name, id, revision: next_id(), config, keys, active: None }
+    }
+
+    // another user of the computer turned it on: its login is theirs
+    fn other_user(&self, client: &Client) -> bool {
+        self.active.as_ref().is_some_and(|active| active.session != client.session)
+    }
+
+    // The tunnel is on with the key of its configuration file, and the server takes it: a handshake came with it.
+    // Then the server has no other key of the tunnel, those of this computer are of before. Without keys of this
+    // computer, the key of the file is the only one there is. The handshake is read here, not only at the watch of
+    // every second: the app asks right after the login.
+    fn on_file_key(&self) -> bool {
+        let Some(active) = &self.active else { return false };
+        if active.key.key != self.config.private_key {
+            return false;
+        }
+        if self.keys.is_empty() || active.key.confirmed {
+            return true;
+        }
+        let handshake = active.tunnel.peers().iter().map(|stats| stats.last_handshake).max().unwrap_or(0);
+        handshake != 0 && handshake >= active.key.since
     }
 
     // the private key of the next connection: the one the server takes
@@ -174,7 +271,7 @@ impl Entry {
         } else if Some(*key) == self.keys.own {
             "the key of this computer"
         } else {
-            "the new key of this computer"
+            "another key of this computer"
         }
     }
 
@@ -189,14 +286,18 @@ impl Entry {
         })
     }
 
-    // A handshake came with the key in use: the server takes it. A new key becomes the one of this computer; the
-    // key of the file again means a new enrollment on the server, the key of this computer is kept for a while as
-    // pending, in case the server only lost it for some time. A pending key stays: it's the one being given to the
-    // server, or one it may take later.
+    // A handshake came with the key in use: the server takes it. The only proof of it: what the app says the server
+    // said is only a hint, see Manager::wireguard_key. A new key becomes the one of this computer, and the one it
+    // replaces stays as pending: the server may take it again, and a handshake in the second the key changed can
+    // still be the one of the key before. The key of the file again means a new enrollment on the server, the key of
+    // this computer is kept as pending too, in case the server only lost it for some time. A pending key stays: it's
+    // the one being given to the server, or one it may take later. So a key the server may have is never forgotten,
+    // only replaced as pending by a new key, which the server takes in place of the key of the file: see
+    // Entry::on_file_key.
     fn confirmed(&mut self, key: conf::Key) {
         let before = self.keys;
         if Some(key) == self.keys.pending && Some(key) != self.keys.own {
-            self.keys = OwnKeys { own: Some(key), pending: None };
+            self.keys = OwnKeys { own: Some(key), pending: self.keys.own };
             log!("{}: the server takes the key of this computer, the configuration file no longer connects", self.name);
         } else if key == self.config.private_key && self.keys.own.is_some() {
             self.keys = OwnKeys { own: None, pending: self.keys.own };
@@ -269,6 +370,32 @@ pub struct Client {
     pub can_manage: bool,
 }
 
+// Turning a tunnel on, in three steps: what it needs, under the lock of the manager; the addresses of its servers,
+// out of it, since a lookup can take seconds and the apps of every user wait for the lock; then on, under the lock
+// again, unless its configuration changed meanwhile. See handle.
+enum UpStep {
+    Done(Response),
+    Find(UpPlan),
+}
+
+struct UpPlan {
+    name: String,
+    revision: u64,
+    config: Config,
+}
+
+fn not_found(name: &str) -> Response {
+    Response::failure(ipc::NOT_FOUND, format!("There's no VPN named {}.", name))
+}
+
+fn in_use(name: &str) -> Response {
+    Response::failure(ipc::IN_USE, format!("{} is connected by another user of this computer.", name))
+}
+
+fn others_login(name: &str) -> Response {
+    Response::failure(ipc::ACCESS_DENIED, format!("{} was connected by another user of this computer.", name))
+}
+
 impl Manager {
     pub fn load(engine: Box<dyn Engine>) -> Manager {
         let mut entries = Vec::new();
@@ -289,17 +416,81 @@ impl Manager {
         self.entries.iter_mut().find(|entry| entry.name.eq_ignore_ascii_case(name))
     }
 
-    fn list(&self) -> Vec<TunnelInfo> {
-        self.entries.iter().map(info).collect()
+    fn index_of(&self, name: &str) -> Option<usize> {
+        self.entries.iter().position(|entry| entry.name.eq_ignore_ascii_case(name))
     }
 
-    fn up(&mut self, name: &str, session: u32) -> Response {
-        let Some(index) = self.entries.iter().position(|entry| entry.name.eq_ignore_ascii_case(name)) else {
-            return Response::failure(ipc::NOT_FOUND, format!("There's no VPN named {}.", name));
-        };
-        if self.entries[index].active.is_some() {
-            return Response::success();
+    // as the user of the session sees them
+    fn list(&self, session: u32) -> Vec<TunnelInfo> {
+        self.entries.iter().map(|entry| info(entry, session)).collect()
+    }
+
+    // The login of a tunnel is the one of the user who turned it on: another user can't act on it, an
+    // administrator neither. None when the client may.
+    fn others(&self, name: &str, client: &Client) -> Option<Response> {
+        let entry = self.entries.iter().find(|entry| entry.name.eq_ignore_ascii_case(name))?;
+        entry.other_user(client).then(|| others_login(&entry.name))
+    }
+
+    // Whether the tunnel can go on for the client: not while it's on for another user, and not when it would turn
+    // off a tunnel of another user, unless the client can manage the VPNs, and so remove them anyway
+    fn can_go_on(&self, index: usize, client: &Client) -> Option<Response> {
+        let entry = &self.entries[index];
+        if entry.other_user(client) {
+            return Some(in_use(&entry.name));
         }
+        if entry.active.is_some() {
+            return Some(Response::success());
+        }
+        if client.can_manage {
+            return None;
+        }
+        self.entries.iter().find(|other| other.other_user(client)).map(|other| in_use(&other.name))
+    }
+
+    fn plan_up(&self, name: &str, client: &Client) -> UpStep {
+        let Some(index) = self.index_of(name) else {
+            return UpStep::Done(not_found(name));
+        };
+        if let Some(response) = self.can_go_on(index, client) {
+            return UpStep::Done(response);
+        }
+        let entry = &self.entries[index];
+        UpStep::Find(UpPlan { name: entry.name.clone(), revision: entry.revision, config: entry.config.clone() })
+    }
+
+    // with the servers found out of the lock: None when the configuration changed meanwhile, to find them again
+    fn finish_up(
+        &mut self,
+        plan: &UpPlan,
+        client: &Client,
+        found: Result<Vec<Option<Failover>>, String>,
+    ) -> Option<Response> {
+        let Some(index) = self.index_of(&plan.name) else {
+            return Some(not_found(&plan.name));
+        };
+        if self.entries[index].revision != plan.revision {
+            return None;
+        }
+        // another request turned it, or another one, on meanwhile
+        if let Some(response) = self.can_go_on(index, client) {
+            return Some(response);
+        }
+        Some(self.start(index, client.session, found))
+    }
+
+    // all under the lock: for the tests, the services go through handle()
+    fn up(&mut self, name: &str, client: &Client) -> Response {
+        match self.plan_up(name, client) {
+            UpStep::Done(response) => response,
+            UpStep::Find(plan) => {
+                let found = resolve(&plan.name, &plan.config);
+                self.finish_up(&plan, client, found).expect("the same configuration")
+            }
+        }
+    }
+
+    fn start(&mut self, index: usize, session: u32, found: Result<Vec<Option<Failover>>, String>) -> Response {
         // One VPN at a time: two tunnels would take the same routes, and one of them would carry nothing while it says
         // it's connected. The others go off first, with their routes and DNS servers, even if this one can't start.
         let name = self.entries[index].name.clone();
@@ -313,7 +504,7 @@ impl Manager {
         let key = entry.first_key();
         let mut config = entry.config.clone();
         config.private_key = key;
-        let started = resolve(&entry.name, &config).and_then(|failovers| {
+        let started = found.and_then(|failovers| {
             let endpoints: Vec<Option<SocketAddr>> =
                 failovers.iter().map(|failover| failover.as_ref().map(Failover::address)).collect();
             // before the start: the first handshake can come while the routes are set
@@ -343,9 +534,15 @@ impl Manager {
         }
     }
 
-    fn down(&mut self, name: &str) -> Response {
+    // the VPN of another user: only for a user who can manage the VPNs, and so remove it anyway
+    fn down(&mut self, name: &str, client: &Client) -> Response {
+        if !client.can_manage {
+            if let Some(refused) = self.others(name, client) {
+                return refused;
+            }
+        }
         match self.find(name) {
-            None => Response::failure(ipc::NOT_FOUND, format!("There's no VPN named {}.", name)),
+            None => not_found(name),
             Some(entry) => {
                 if entry.active.take().is_some() {
                     log!("{}: off", entry.name);
@@ -378,52 +575,59 @@ impl Manager {
                 Some(_) => {}
             }
         }
-        let existing = self.entries.iter().position(|entry| entry.name.eq_ignore_ascii_case(name));
+        let existing = self.index_of(name);
         if existing.is_some() && !replace {
             return Response::failure(ipc::EXISTS, format!("There's already a VPN named {}.", name));
         }
-        if let Some(index) = existing {
-            // its key keeps the first spelling of the name
-            let entry = self.entries.remove(index);
-            if entry.active.is_some() {
-                log!("{}: off, to be replaced", entry.name);
+        // On the disk first: the VPN stays as it was, on too, when it can't be saved. Another spelling of the name
+        // is a rename first, with the GUID and the device key: the registry and the file system keep the first one.
+        if let Some(index) = existing.filter(|&index| self.entries[index].name != name) {
+            let entry = &mut self.entries[index];
+            if let Err(error) = disk::rename(&entry.name, name) {
+                log!("{}: can't rename: {}", entry.name, error);
+                return Response::failure(ipc::FAILED, format!("Can't rename the configuration: {}.", error));
             }
-            if entry.name != name {
-                let _ = store::delete(&entry.name);
-            }
+            disk::rename_device_key(&entry.name, name, &entry.id);
+            log!("{}: renamed {}", entry.name, name);
+            entry.name = name.to_string();
         }
-        match store::save(name, text) {
-            Ok(stored) => {
-                log!("{}: {}", name, if existing.is_some() { "replaced" } else { "added" });
-                for ignored in &config.ignored {
-                    log!("{}: {} is ignored", name, ignored);
-                }
-                // the keys made for the old file are gone with it
-                self.entries.push(Entry::new(stored.name, stored.id, config, OwnKeys::default()));
-                self.entries.sort_by_key(|entry| entry.name.to_lowercase());
-                Response::success()
-            }
+        let stored = match disk::save(name, text) {
+            Ok(stored) => stored,
             Err(error) => {
                 log!("{}: can't save: {}", name, error);
-                Response::failure(ipc::FAILED, format!("Can't save the configuration: {}.", error))
+                return Response::failure(ipc::FAILED, format!("Can't save the configuration: {}.", error));
+            }
+        };
+        if let Some(index) = existing {
+            if self.entries.remove(index).active.is_some() {
+                log!("{}: off, replaced", name);
             }
         }
+        log!("{}: {}", name, if existing.is_some() { "replaced" } else { "added" });
+        for ignored in &config.ignored {
+            log!("{}: {} is ignored", name, ignored);
+        }
+        // the keys made for the old file are gone with it
+        self.entries.push(Entry::new(stored.name, stored.id, config, OwnKeys::default()));
+        self.entries.sort_by_key(|entry| entry.name.to_lowercase());
+        Response::success()
     }
 
     fn remove(&mut self, name: &str) -> Response {
-        let Some(index) = self.entries.iter().position(|entry| entry.name.eq_ignore_ascii_case(name)) else {
-            return Response::failure(ipc::NOT_FOUND, format!("There's no VPN named {}.", name));
+        let Some(index) = self.index_of(name) else {
+            return not_found(name);
         };
+        // from the disk first: the VPN stays as it was, on too, when it can't be removed
+        if let Err(error) = disk::delete(&self.entries[index].name) {
+            log!("{}: can't remove: {}", self.entries[index].name, error);
+            return Response::failure(ipc::FAILED, format!("Can't remove the configuration: {}.", error));
+        }
+        // off, with its routes and DNS servers
         let entry = self.entries.remove(index);
         drop(entry.active);
-        match store::delete(&entry.name) {
-            Ok(()) => {
-                devkey::delete(&entry.name, &entry.id);
-                log!("{}: removed", entry.name);
-                Response::success()
-            }
-            Err(error) => Response::failure(ipc::FAILED, format!("Can't remove the configuration: {}.", error)),
-        }
+        disk::delete_device_key(&entry.name, &entry.id);
+        log!("{}: removed", entry.name);
+        Response::success()
     }
 
     // only while it's off: the app knows the tunnels that are on by their names
@@ -431,8 +635,8 @@ impl Manager {
         if !conf::is_valid_name(new_name) {
             return Response::failure(ipc::INVALID, format!("\"{}\" can't be the name of a VPN.", new_name));
         }
-        let Some(index) = self.entries.iter().position(|entry| entry.name.eq_ignore_ascii_case(name)) else {
-            return Response::failure(ipc::NOT_FOUND, format!("There's no VPN named {}.", name));
+        let Some(index) = self.index_of(name) else {
+            return not_found(name);
         };
         let taken = self.entries.iter().enumerate().any(|(other, entry)| other != index && entry.name.eq_ignore_ascii_case(new_name));
         if taken {
@@ -445,11 +649,11 @@ impl Manager {
         if entry.active.is_some() {
             return Response::failure(ipc::INVALID, format!("Disconnect {} before renaming it.", entry.name));
         }
-        if let Err(error) = store::rename(&entry.name, new_name) {
+        if let Err(error) = disk::rename(&entry.name, new_name) {
             log!("{}: can't rename: {}", entry.name, error);
             return Response::failure(ipc::FAILED, format!("Can't rename the configuration: {}.", error));
         }
-        devkey::rename(&entry.name, new_name, &entry.id);
+        disk::rename_device_key(&entry.name, new_name, &entry.id);
         log!("{}: renamed {}", entry.name, new_name);
         entry.name = new_name.to_string();
         self.entries.sort_by_key(|entry| entry.name.to_lowercase());
@@ -580,16 +784,29 @@ impl Manager {
         }
     }
 
-    pub fn handle(&mut self, request: Request, client: &Client) -> Response {
+    // Under the lock: the services go through handle(), which finds the servers of a tunnel that goes on out of it
+    fn handle_locked(&mut self, request: Request, client: &Client) -> Response {
         let denied = || {
             Response::failure(ipc::ACCESS_DENIED, "Only an administrator can add, rename or remove a VPN on this computer.")
         };
+        // the login of a tunnel, its routes and its keys: only the user who turned it on
+        let session_name = match &request {
+            Request::LoggedIn { name, .. }
+            | Request::Sign { name, .. }
+            | Request::DeviceKey { name }
+            | Request::NewWireguardKey { name, .. }
+            | Request::WireguardKey { name, .. } => Some(name),
+            _ => None,
+        };
+        if let Some(refused) = session_name.and_then(|name| self.others(name, client)) {
+            return refused;
+        }
         match request {
             Request::List => {
-                Response { ok: true, tunnels: self.list(), can_manage: client.can_manage, ..Response::default() }
+                Response { ok: true, tunnels: self.list(client.session), can_manage: client.can_manage, ..Response::default() }
             }
-            Request::Up { name } => self.up(&name, client.session),
-            Request::Down { name } => self.down(&name),
+            Request::Up { name } => self.up(&name, client),
+            Request::Down { name } => self.down(&name, client),
             Request::Import { name, config, replace } => {
                 if !client.can_manage {
                     return denied();
@@ -619,13 +836,19 @@ impl Manager {
     }
 
     // A WireGuard key for the server of a tunnel that's on, kept pending before the request leaves: if the answer of
-    // the server is lost, the tunnel can still try the key when the one in use stops working
+    // the server is lost, the tunnel can still try the key when the one in use stops working. Only in place of the key
+    // of the configuration file, which the server takes now: the server has no other key of the tunnel, so the
+    // pending key this one replaces isn't one it has.
     fn new_wireguard_key(&mut self, name: &str, host: Ipv4Addr, challenge: &str) -> Response {
         let Some(entry) = self.find(name) else {
-            return Response::failure(ipc::NOT_FOUND, format!("There's no VPN named {}.", name));
+            return not_found(name);
         };
         if entry.active.is_none() {
             return Response::failure(ipc::INVALID, format!("{} isn't connected.", entry.name));
+        }
+        if !entry.on_file_key() {
+            log!("{}: no key of this computer for the server: the tunnel doesn't use the key of the file", entry.name);
+            return Response::failure(ipc::INVALID, format!("{} doesn't use the key of its configuration file.", entry.name));
         }
         let made = x25519::new_private_key().and_then(|key| {
             let request = device::wireguard_key(&entry.name, &entry.id, &entry.config, host, challenge, &x25519::public_key(&key))?;
@@ -648,39 +871,49 @@ impl Manager {
         Response { ok: true, new_key: Some(request), ..Response::default() }
     }
 
-    // The server took the pending key, and switches to it: the tunnel too, at once. Or it refused it.
+    // What the app says the server said of the pending key. Only a hint: any program of the user can say it, so the
+    // keys stay as they are, and only a handshake makes the pending key the one of this computer (see
+    // Entry::confirmed). Taken: the tunnel tries it at once, and goes back to the key of the file if no handshake
+    // comes. Refused: forgotten. Both only while the tunnel works with the key of the file, as when the app asked for
+    // the key: else the pending key may be one the server has.
     fn wireguard_key(&mut self, name: &str, accepted: bool) -> Response {
         let Some(entry) = self.find(name) else {
-            return Response::failure(ipc::NOT_FOUND, format!("There's no VPN named {}.", name));
+            return not_found(name);
         };
         let Some(key) = entry.keys.pending else {
             return Response::success();
         };
+        if !entry.on_file_key() {
+            log!("{}: what the server said of the key of this computer doesn't apply: the tunnel moved", entry.name);
+            return Response::failure(ipc::INVALID, format!("{} doesn't use the key of its configuration file.", entry.name));
+        }
         if !accepted {
             entry.keys.pending = None;
             log!("{}: the server refused the key of this computer", entry.name);
             let _ = entry.save_keys();
             return Response::success();
         }
-        entry.keys = OwnKeys { own: Some(key), pending: None };
-        let _ = entry.save_keys();
-        if let Some(active) = entry.active.as_mut() {
-            let tx = active.tunnel.peers().iter().map(|stats| stats.tx_bytes).sum();
-            // before the change: the handshake it starts can come at once
-            let since = unix_now();
-            match active.tunnel.set_private_key(&key) {
-                Ok(()) => active.key = KeyUse::new(key, since, tx),
-                Err(error) => log!("{}: {}", entry.name, error),
+        let active = entry.active.as_mut().expect("on");
+        let tx = active.tunnel.peers().iter().map(|stats| stats.tx_bytes).sum();
+        // before the change: the handshake it starts can come at once
+        let since = unix_now();
+        match active.tunnel.set_private_key(&key) {
+            Ok(()) => {
+                active.key = KeyUse::new(key, since, tx);
+                log!("{}: the server says it takes the key of this computer, waiting for its handshake", entry.name);
+                Response::success()
+            }
+            Err(error) => {
+                log!("{}: {}", entry.name, error);
+                Response::failure(ipc::FAILED, error)
             }
         }
-        log!("{}: the server takes the key of this computer, the configuration file no longer connects", entry.name);
-        Response::success()
     }
 
     // the ID of the device key of a tunnel: whose it is, not the key
     fn device_key(&mut self, name: &str) -> Response {
         let Some(entry) = self.find(name) else {
-            return Response::failure(ipc::NOT_FOUND, format!("There's no VPN named {}.", name));
+            return not_found(name);
         };
         match device::key_id(&entry.name, &entry.id) {
             Ok(id) => Response { ok: true, device_key: Some(id), ..Response::default() },
@@ -709,7 +942,8 @@ impl Manager {
     }
 }
 
-fn info(entry: &Entry) -> TunnelInfo {
+// a tunnel as the user of the session sees it
+fn info(entry: &Entry, session: u32) -> TunnelInfo {
     let config = &entry.config;
     let active = entry.active.as_ref();
     let stats = active.map(|active| active.tunnel.peers()).unwrap_or_default();
@@ -751,6 +985,7 @@ fn info(entry: &Entry) -> TunnelInfo {
         routes: config.routes().iter().map(ToString::to_string).collect(),
         after_login: steps(config).after.iter().map(ToString::to_string).collect(),
         logged_in: active.is_some_and(|active| active.logged_in),
+        other_user: active.is_some_and(|active| active.session != session),
         interface: active.map_or(0, |active| active.tunnel.interface()),
         since: active.map_or(0, |active| active.since),
         handshake: peers.iter().map(|peer| peer.handshake).max().unwrap_or(0),
@@ -771,11 +1006,50 @@ fn info(entry: &Entry) -> TunnelInfo {
 
 // the address of each server: the one of its Endpoint, or of the first fallback that can be found
 fn resolve(name: &str, config: &Config) -> Result<Vec<Option<Failover>>, String> {
-    let failovers = config.peers.iter().map(Failover::start).collect::<Result<Vec<_>, _>>()?;
+    let failovers = config
+        .peers
+        .iter()
+        .map(|peer| Failover::start(peer, failover::CONNECT_LOOKUP_TIME))
+        .collect::<Result<Vec<_>, _>>()?;
     for failover in failovers.iter().flatten().filter(|failover| failover.index() > 0) {
         log!("{}: the endpoint can't be found, fallback {} instead: {}", name, failover.index(), failover.endpoint());
     }
     Ok(failovers)
+}
+
+fn lock(manager: &Mutex<Manager>) -> MutexGuard<'_, Manager> {
+    manager.lock().unwrap_or_else(|error| error.into_inner())
+}
+
+// A request of an app, for the service: under the lock of the manager, but the servers of a tunnel that goes on are
+// looked up out of it, so the apps of every user get their answers meanwhile
+pub fn handle(manager: &Mutex<Manager>, request: Request, client: &Client) -> Response {
+    handle_with(manager, request, client, resolve)
+}
+
+fn handle_with(
+    manager: &Mutex<Manager>,
+    request: Request,
+    client: &Client,
+    find: impl Fn(&str, &Config) -> Result<Vec<Option<Failover>>, String>,
+) -> Response {
+    let Request::Up { name } = request else {
+        return lock(manager).handle_locked(request, client);
+    };
+    for _ in 0..UP_ATTEMPTS {
+        let step = lock(manager).plan_up(&name, client);
+        let plan = match step {
+            UpStep::Done(response) => return response,
+            UpStep::Find(plan) => plan,
+        };
+        let found = find(&plan.name, &plan.config);
+        let finished = lock(manager).finish_up(&plan, client, found);
+        if let Some(response) = finished {
+            return response;
+        }
+        log!("{}: replaced while its servers were looked up, again", plan.name);
+    }
+    Response::failure(ipc::FAILED, format!("The configuration of {} changed while it was turning on.", name))
 }
 
 // The fallbacks of the servers that stop answering, until the service stops; `each` runs every POLL too, with the
@@ -988,6 +1262,11 @@ mod tests {
                           [Peer]\nPublicKey = xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=\nAllowedIPs = 10.103.1.0/24\n\
                           Endpoint = 192.0.2.1:51820\n# Fallback = 192.0.2.2:51820\nPersistentKeepalive = 25\n";
 
+    // the user who turned Office on, in office(); another one, who can or can't manage the VPNs
+    const OWNER: Client = Client { session: 1, can_manage: false };
+    const OTHER: Client = Client { session: 2, can_manage: false };
+    const OTHER_ADMIN: Client = Client { session: 2, can_manage: true };
+
     // Office, on, as up() leaves it
     fn office() -> (Manager, Arc<Mutex<Script>>) {
         let config = conf::parse(CONFIG).unwrap();
@@ -1049,7 +1328,7 @@ mod tests {
     }
 
     fn on(manager: &Manager) -> Vec<String> {
-        manager.list().into_iter().filter(|info| info.up).map(|info| info.name).collect()
+        manager.list(1).into_iter().filter(|info| info.up).map(|info| info.name).collect()
     }
 
     #[test]
@@ -1062,21 +1341,21 @@ mod tests {
         manager.engine = Box::new(StartEngine(started.clone()));
         assert_eq!(on(&manager), ["Office"]);
         // Home goes on: Office goes off
-        assert!(manager.up("Home", 1).ok);
+        assert!(manager.up("Home", &OWNER).ok);
         assert_eq!(on(&manager), ["Home"]);
         // again: nothing changes, nothing starts again
-        assert!(manager.up("home", 1).ok);
+        assert!(manager.up("home", &OWNER).ok);
         assert_eq!(on(&manager), ["Home"]);
         assert_eq!(*started.lock().unwrap(), ["Home"]);
         // and back
-        assert!(manager.up("Office", 1).ok);
+        assert!(manager.up("Office", &OWNER).ok);
         assert_eq!(on(&manager), ["Office"]);
         // a VPN that doesn't exist turns nothing off
-        assert!(!manager.up("Lab", 1).ok);
+        assert!(!manager.up("Lab", &OWNER).ok);
         assert_eq!(on(&manager), ["Office"]);
         // one that can't start: the other is off anyway, as when it starts
         manager.engine = Box::new(NoEngine);
-        assert!(!manager.up("Home", 1).ok);
+        assert!(!manager.up("Home", &OWNER).ok);
         assert!(on(&manager).is_empty());
     }
 
@@ -1084,7 +1363,7 @@ mod tests {
     fn a_line_goes_down() {
         let (mut manager, script) = office();
         let start = Instant::now();
-        let info = &manager.list()[0];
+        let info = &manager.list(1)[0];
         assert_eq!((info.endpoint.as_str(), info.peers[0].in_use.as_str()), ("192.0.2.1:51820", "192.0.2.1:51820"));
         assert_eq!(info.peers[0].fallbacks, ["192.0.2.2:51820"]);
 
@@ -1098,7 +1377,7 @@ mod tests {
         let address = failover::lookup(&switch.next.endpoint, failover::LOOKUP_TIME);
         manager.switch(switch, address);
         assert_eq!(script.lock().unwrap().endpoint, Some("192.0.2.2:51820".parse().unwrap()));
-        let info = &manager.list()[0];
+        let info = &manager.list(1)[0];
         assert_eq!((info.endpoint.as_str(), info.peers[0].in_use.as_str()), ("192.0.2.2:51820", "192.0.2.2:51820"));
         let peer = &info.peers[0];
         assert_eq!((peer.endpoint.as_str(), peer.address.as_str()), ("192.0.2.1:51820", "192.0.2.2:51820"));
@@ -1107,7 +1386,7 @@ mod tests {
         for second in 23..200 {
             assert!(poll(&mut manager, &script, start, second, 92 * second, 148 * second).is_empty(), "{}", second);
         }
-        assert_eq!(manager.list()[0].peers[0].in_use, "192.0.2.2:51820");
+        assert_eq!(manager.list(1)[0].peers[0].in_use, "192.0.2.2:51820");
 
         // it stops too: back to the first
         let (_, switch) = silent_until_switch(&mut manager, &script, start, 200);
@@ -1130,11 +1409,11 @@ mod tests {
         script.lock().unwrap().refuse = true;
         let (second, switch) = silent_until_switch(&mut manager, &script, start, 100);
         manager.switch(switch, address);
-        assert_eq!(manager.list()[0].peers[0].in_use, "192.0.2.1:51820");
+        assert_eq!(manager.list(1)[0].peers[0].in_use, "192.0.2.1:51820");
         let (next, _) = silent_until_switch(&mut manager, &script, start, second + 1);
         assert_eq!(next, second + 1 + failover::SILENCE.as_secs());
         // off: nothing to watch
-        manager.down("Office");
+        manager.down("Office", &OWNER);
         assert!(poll(&mut manager, &script, start, 300, 0, 0).is_empty());
     }
 
@@ -1146,7 +1425,7 @@ mod tests {
         manager.entries.push(Entry::new("Home".into(), store::Id::default(), config, OwnKeys::default()));
         let admin = Client { session: 1, can_manage: true };
         let rename = |manager: &mut Manager, name: &str, new_name: &str, client: &Client| {
-            manager.handle(Request::Rename { name: name.into(), new_name: new_name.into() }, client)
+            manager.handle_locked(Request::Rename { name: name.into(), new_name: new_name.into() }, client)
         };
         let user = Client { session: 1, can_manage: false };
         assert_eq!(rename(&mut manager, "Home", "Lab", &user).error_code(), ipc::ACCESS_DENIED);
@@ -1158,7 +1437,7 @@ mod tests {
         assert_eq!(rename(&mut manager, "Office", "Work", &admin).error_code(), ipc::INVALID);
         // the same name: nothing to do
         assert!(rename(&mut manager, "home", "Home", &admin).ok);
-        assert_eq!(manager.list().iter().map(|info| info.name.as_str()).collect::<Vec<_>>(), ["Office", "Home"]);
+        assert_eq!(manager.list(1).iter().map(|info| info.name.as_str()).collect::<Vec<_>>(), ["Office", "Home"]);
     }
 
     // CONFIG with a login page and other routes
@@ -1197,24 +1476,24 @@ mod tests {
         let (mut manager, script) = office();
         let user = Client { session: 1, can_manage: false };
         let logged_in = |manager: &mut Manager, on: bool| {
-            manager.handle(Request::LoggedIn { name: "Office".into(), logged_in: on }, &user)
+            manager.handle_locked(Request::LoggedIn { name: "Office".into(), logged_in: on }, &user)
         };
         // no login page: nothing waits
         assert!(logged_in(&mut manager, true).ok);
-        assert!(!script.lock().unwrap().after_login && !manager.list()[0].logged_in);
-        assert!(manager.list()[0].after_login.is_empty());
+        assert!(!script.lock().unwrap().after_login && !manager.list(1)[0].logged_in);
+        assert!(manager.list(1)[0].after_login.is_empty());
         manager.entries[0].config = with_login("0.0.0.0/0");
-        assert_eq!(manager.list()[0].after_login, ["0.0.0.0/0"]);
+        assert_eq!(manager.list(1)[0].after_login, ["0.0.0.0/0"]);
         assert!(logged_in(&mut manager, true).ok);
-        assert!(script.lock().unwrap().after_login && manager.list()[0].logged_in);
+        assert!(script.lock().unwrap().after_login && manager.list(1)[0].logged_in);
         // the session ended
         assert!(logged_in(&mut manager, false).ok);
-        assert!(!script.lock().unwrap().after_login && !manager.list()[0].logged_in);
+        assert!(!script.lock().unwrap().after_login && !manager.list(1)[0].logged_in);
         // refused by the system: still off, and said
         script.lock().unwrap().refuse = true;
         assert_eq!(logged_in(&mut manager, true).error_code(), ipc::FAILED);
-        assert!(!manager.list()[0].logged_in);
-        manager.down("Office");
+        assert!(!manager.list(1)[0].logged_in);
+        manager.down("Office", &OWNER);
         assert_eq!(logged_in(&mut manager, true).error_code(), ipc::INVALID);
     }
 
@@ -1255,7 +1534,7 @@ mod tests {
         // a handshake with it: the server took it, it's the key of this computer now
         watch_key(&mut manager, &script, 1031, 400, 1031);
         assert_eq!(manager.entries[0].keys, OwnKeys { own: Some(NEW_KEY), pending: None });
-        let info = &manager.list()[0];
+        let info = &manager.list(1)[0];
         assert!(info.own_key);
         assert_eq!(info.public_key, conf::encode_key(&x25519::public_key(&NEW_KEY)));
         // no packets: nothing to say, however long
@@ -1281,7 +1560,7 @@ mod tests {
         // the key of this computer is kept a while, the next connection starts with the key of the file
         assert_eq!(manager.entries[0].keys, OwnKeys { own: None, pending: Some(NEW_KEY) });
         assert_eq!(manager.entries[0].first_key(), file);
-        assert!(!manager.list()[0].own_key);
+        assert!(!manager.list(1)[0].own_key);
         // the key of the file works at once at the next connection: the pending key stays, it may be the one
         // being given to the server right now
         let (mut manager, script) = office_with(OwnKeys { own: None, pending: Some(NEW_KEY) });
@@ -1321,32 +1600,260 @@ mod tests {
         assert_eq!(script.lock().unwrap().key, Some(NEW_KEY));
     }
 
+    const OLD_KEY: conf::Key = [7; 32];
+
+    // what the app says the server said of the pending key
+    fn answer(manager: &mut Manager, accepted: bool) -> Response {
+        manager.handle_locked(Request::WireguardKey { name: "Office".into(), accepted }, &OWNER)
+    }
+
+    fn new_key_request() -> Request {
+        Request::NewWireguardKey { name: "Office".into(), host: "10.103.1.1".parse().unwrap(), challenge: "C".into() }
+    }
+
     #[test]
     fn what_the_server_said_of_the_key() {
-        let user = Client { session: 1, can_manage: false };
-        let answer = |manager: &mut Manager, accepted: bool| {
-            manager.handle(Request::WireguardKey { name: "Office".into(), accepted }, &user)
-        };
-        // refused: forgotten
+        // asked for in place of the key of the file, which works: a handshake came with it
         let (mut manager, script) = office_with(OwnKeys { own: None, pending: Some(NEW_KEY) });
+        script.lock().unwrap().handshake = 1001;
+        // refused: forgotten
         assert!(answer(&mut manager, false).ok);
         assert!(manager.entries[0].keys.is_empty() && script.lock().unwrap().key.is_none());
-        // taken: the key of this computer, at once in the tunnel
+        // taken: tried at once in the tunnel, but the key of this computer only with a handshake
         manager.entries[0].keys.pending = Some(NEW_KEY);
         assert!(answer(&mut manager, true).ok);
-        assert_eq!(manager.entries[0].keys, OwnKeys { own: Some(NEW_KEY), pending: None });
         assert_eq!(script.lock().unwrap().key, Some(NEW_KEY));
         assert_eq!(manager.entries[0].key_in_use(), NEW_KEY);
+        assert_eq!(manager.entries[0].keys, OwnKeys { own: None, pending: Some(NEW_KEY) });
+        let now = unix_now();
+        watch_key(&mut manager, &script, now, 400, now);
+        assert_eq!(manager.entries[0].keys, OwnKeys { own: Some(NEW_KEY), pending: None });
         // nothing pending: nothing changes
         assert!(answer(&mut manager, true).ok);
         assert_eq!(manager.entries[0].keys.own, Some(NEW_KEY));
-        let missing = manager.handle(Request::WireguardKey { name: "Nowhere".into(), accepted: true }, &user);
+        let missing = manager.handle_locked(Request::WireguardKey { name: "Nowhere".into(), accepted: true }, &OWNER);
         assert_eq!(missing.error_code(), ipc::NOT_FOUND);
         // off: no new key
-        manager.down("Office");
-        let host = "10.103.1.1".parse().unwrap();
-        let request = Request::NewWireguardKey { name: "Office".into(), host, challenge: "C".into() };
-        assert_eq!(manager.handle(request, &user).error_code(), ipc::INVALID);
+        manager.down("Office", &OWNER);
+        assert_eq!(manager.handle_locked(new_key_request(), &OWNER).error_code(), ipc::INVALID);
+    }
+
+    // Any program of the user can say that the server took a key: a key the server has is never lost for it
+    #[test]
+    fn a_key_the_server_never_took() {
+        let file = conf::parse(CONFIG).unwrap().private_key;
+        // the tunnel works with the key of this computer, the one the server has
+        let (mut manager, script) = office_with(OwnKeys { own: Some(OLD_KEY), pending: None });
+        watch_key(&mut manager, &script, 1001, 148, 1001);
+        // no new key for the server in its place, and what the app says changes nothing
+        assert_eq!(manager.handle_locked(new_key_request(), &OWNER).error_code(), ipc::INVALID);
+        manager.entries[0].keys.pending = Some(NEW_KEY);
+        assert_eq!(answer(&mut manager, true).error_code(), ipc::INVALID);
+        assert_eq!(answer(&mut manager, false).error_code(), ipc::INVALID);
+        assert_eq!(script.lock().unwrap().key, None);
+        assert_eq!(manager.entries[0].keys, OwnKeys { own: Some(OLD_KEY), pending: Some(NEW_KEY) });
+
+        // in place of the key of the file, which works: the new key is tried, but no handshake comes with it. Back to
+        // the key of the file, with the new key still pending
+        let (mut manager, script) = office_with(OwnKeys { own: None, pending: Some(NEW_KEY) });
+        script.lock().unwrap().handshake = 1001;
+        assert!(answer(&mut manager, true).ok);
+        assert_eq!(script.lock().unwrap().key, Some(NEW_KEY));
+        let since = manager.entries[0].active.as_ref().unwrap().key.since;
+        watch_key(&mut manager, &script, since + KEY_SILENCE, 5000, 1001);
+        assert_eq!(script.lock().unwrap().key, Some(file));
+        assert_eq!(manager.entries[0].keys, OwnKeys { own: None, pending: Some(NEW_KEY) });
+        assert_eq!(manager.entries[0].first_key(), file);
+    }
+
+    // A key with a handshake becomes the one of this computer, and the one before stays pending
+    #[test]
+    fn the_key_before_stays() {
+        let file = conf::parse(CONFIG).unwrap().private_key;
+        let (mut manager, script) = office_with(OwnKeys { own: Some(OLD_KEY), pending: Some(NEW_KEY) });
+        manager.entries[0].active.as_mut().unwrap().key = KeyUse::new(NEW_KEY, 1000, 0);
+        watch_key(&mut manager, &script, 1000, 148, 1000);
+        assert_eq!(manager.entries[0].keys, OwnKeys { own: Some(NEW_KEY), pending: Some(OLD_KEY) });
+        // the new key stops working: the key of the file, then the one before, which the server takes
+        watch_key(&mut manager, &script, 1000 + KEY_LOST, 9000, 1000);
+        assert_eq!(script.lock().unwrap().key, Some(file));
+        watch_key(&mut manager, &script, 1000 + KEY_LOST + KEY_SILENCE, 9500, 1000);
+        assert_eq!(script.lock().unwrap().key, Some(OLD_KEY));
+        let now = 1001 + KEY_LOST + KEY_SILENCE;
+        watch_key(&mut manager, &script, now, 9600, now);
+        assert_eq!(manager.entries[0].keys, OwnKeys { own: Some(OLD_KEY), pending: Some(NEW_KEY) });
+    }
+
+    #[test]
+    fn the_vpn_of_another_user() {
+        let (mut manager, _) = office();
+        #[allow(clippy::default_constructed_unit_structs)]
+        let home = Entry::new("Home".into(), store::Id::default(), conf::parse(CONFIG).unwrap(), OwnKeys::default());
+        manager.entries.push(home);
+        let started = Arc::new(Mutex::new(Vec::new()));
+        manager.engine = Box::new(StartEngine(started.clone()));
+        // the list says whose it is
+        assert!(!manager.list(1)[0].other_user);
+        assert!(manager.list(2)[0].other_user && !manager.list(2)[1].other_user);
+
+        // its login, its routes and its keys are of its user only, not of an administrator either
+        let host: Ipv4Addr = "10.103.1.1".parse().unwrap();
+        let office = || "Office".to_string();
+        let requests = || {
+            [
+                Request::LoggedIn { name: office(), logged_in: true },
+                Request::Sign { name: office(), host, challenge: "C".into(), username: "mallory".into(), machine_id: false },
+                Request::DeviceKey { name: office() },
+                Request::NewWireguardKey { name: office(), host, challenge: "C".into() },
+                Request::WireguardKey { name: office(), accepted: true },
+            ]
+        };
+        for client in [&OTHER, &OTHER_ADMIN] {
+            for request in requests() {
+                let text = format!("{:?}", request);
+                assert_eq!(manager.handle_locked(request, client).error_code(), ipc::ACCESS_DENIED, "{}", text);
+            }
+        }
+        // nor turned off, nor by another VPN that goes on
+        assert_eq!(manager.handle_locked(Request::Down { name: office() }, &OTHER).error_code(), ipc::ACCESS_DENIED);
+        assert_eq!(manager.up("Office", &OTHER).error_code(), ipc::IN_USE);
+        assert_eq!(manager.up("Home", &OTHER).error_code(), ipc::IN_USE);
+        assert_eq!(on(&manager), ["Office"]);
+        assert!(started.lock().unwrap().is_empty());
+
+        // a user who can manage the VPNs, and remove them anyway, can turn it off
+        assert_eq!(manager.up("Office", &OTHER_ADMIN).error_code(), ipc::IN_USE);
+        assert!(manager.up("Home", &OTHER_ADMIN).ok);
+        assert_eq!(on(&manager), ["Home"]);
+        assert!(manager.list(1)[1].other_user && !manager.list(2)[1].other_user);
+        // now the first user can't, and the other one can
+        assert_eq!(manager.down("Home", &OWNER).error_code(), ipc::ACCESS_DENIED);
+        assert_eq!(manager.up("Office", &OWNER).error_code(), ipc::IN_USE);
+        assert!(manager.down("Home", &OTHER).ok);
+        assert!(on(&manager).is_empty());
+        assert!(manager.up("Office", &OWNER).ok);
+    }
+
+    // Office off, with an engine that turns any tunnel on
+    fn office_off() -> (Mutex<Manager>, Arc<Mutex<Vec<String>>>) {
+        let (mut manager, _) = office();
+        manager.entries[0].active = None;
+        let started = Arc::new(Mutex::new(Vec::new()));
+        manager.engine = Box::new(StartEngine(started.clone()));
+        (Mutex::new(manager), started)
+    }
+
+    #[test]
+    fn the_servers_are_looked_up_out_of_the_lock() {
+        let up = || Request::Up { name: "Office".into() };
+        // the apps get their answers meanwhile
+        let (manager, started) = office_off();
+        let response = handle_with(&manager, up(), &OWNER, |name, config| {
+            assert!(manager.try_lock().is_ok(), "the lookup holds the lock of the manager");
+            resolve(name, config)
+        });
+        assert!(response.ok);
+        assert_eq!(*started.lock().unwrap(), ["Office"]);
+
+        // replaced meanwhile: looked up again, for the new configuration
+        let (manager, started) = office_off();
+        let lookups = std::cell::Cell::new(0);
+        let response = handle_with(&manager, up(), &OWNER, |name, config| {
+            lookups.set(lookups.get() + 1);
+            if lookups.get() == 1 {
+                lock(&manager).entries[0].revision = next_id();
+            }
+            resolve(name, config)
+        });
+        assert!(response.ok);
+        assert_eq!((lookups.get(), started.lock().unwrap().len()), (2, 1));
+
+        // replaced every time: given up
+        let (manager, started) = office_off();
+        let response = handle_with(&manager, up(), &OWNER, |name, config| {
+            lock(&manager).entries[0].revision = next_id();
+            resolve(name, config)
+        });
+        assert_eq!(response.error_code(), ipc::FAILED);
+        assert!(started.lock().unwrap().is_empty());
+
+        // removed meanwhile
+        let (manager, _) = office_off();
+        let response = handle_with(&manager, up(), &OWNER, |name, config| {
+            lock(&manager).entries.clear();
+            resolve(name, config)
+        });
+        assert_eq!(response.error_code(), ipc::NOT_FOUND);
+
+        // the server can't be found: said, and nothing goes on
+        let (manager, started) = office_off();
+        let response = handle_with(&manager, up(), &OWNER, |_, _| Err("Can't find the server vpn.example.com.".into()));
+        assert_eq!((response.error_code(), response.message()), (ipc::FAILED, "Can't find the server vpn.example.com."));
+        assert!(started.lock().unwrap().is_empty());
+
+        // nothing to look up: a VPN that doesn't exist, one that's on, one that can't go on
+        let never = |_: &str, _: &Config| -> Result<Vec<Option<Failover>>, String> { panic!("a lookup") };
+        let (manager, _) = office_off();
+        assert_eq!(handle_with(&manager, Request::Up { name: "Lab".into() }, &OWNER, never).error_code(), ipc::NOT_FOUND);
+        assert!(handle_with(&manager, up(), &OWNER, resolve).ok);
+        assert!(handle_with(&manager, up(), &OWNER, never).ok);
+        assert_eq!(handle_with(&manager, up(), &OTHER, never).error_code(), ipc::IN_USE);
+        // the other requests: as under the lock
+        assert!(handle_with(&manager, Request::List, &OWNER, never).tunnels[0].up);
+    }
+
+    fn disk<T>(work: impl FnOnce(&mut disk::Disk) -> T) -> T {
+        disk::DISK.with(|disk| work(&mut disk.borrow_mut()))
+    }
+
+    fn import(manager: &mut Manager, name: &str, replace: bool, client: &Client) -> Response {
+        manager.handle_locked(Request::Import { name: name.into(), config: CONFIG.into(), replace }, client)
+    }
+
+    fn names(manager: &Manager) -> Vec<String> {
+        manager.list(1).into_iter().map(|info| info.name).collect()
+    }
+
+    #[test]
+    fn added_replaced_removed() {
+        let (mut manager, _) = office();
+        disk(|disk| {
+            *disk = disk::Disk::default();
+            disk.files.push(("Office".into(), CONFIG.into()));
+        });
+        let revision = manager.entries[0].revision;
+        let remove = |manager: &mut Manager, name: &str| manager.handle_locked(Request::Remove { name: name.into() }, &OTHER_ADMIN);
+
+        // the disk refuses: everything stays as it was, Office on too
+        disk(|disk| disk.refuse = true);
+        assert_eq!(import(&mut manager, "Home", false, &OTHER_ADMIN).error_code(), ipc::FAILED);
+        assert_eq!(import(&mut manager, "Office", true, &OTHER_ADMIN).error_code(), ipc::FAILED);
+        assert_eq!(import(&mut manager, "OFFICE", true, &OTHER_ADMIN).error_code(), ipc::FAILED);
+        assert_eq!(remove(&mut manager, "Office").error_code(), ipc::FAILED);
+        assert_eq!((names(&manager), on(&manager)), (vec!["Office".to_string()], vec!["Office".to_string()]));
+        assert_eq!(manager.entries[0].revision, revision);
+        assert!(disk(|disk| disk.journal.is_empty()));
+        disk(|disk| disk.refuse = false);
+
+        // added; again only to replace it, and only by a user who can manage the VPNs
+        assert!(import(&mut manager, "Home", false, &OTHER_ADMIN).ok);
+        assert_eq!(import(&mut manager, "home", false, &OTHER_ADMIN).error_code(), ipc::EXISTS);
+        assert_eq!(import(&mut manager, "Home", true, &OWNER).error_code(), ipc::ACCESS_DENIED);
+        // replaced in another spelling: renamed with its device key, then saved; off, with a new configuration
+        assert!(import(&mut manager, "OFFICE", true, &OTHER_ADMIN).ok);
+        assert_eq!(names(&manager), ["Home", "OFFICE"]);
+        assert!(on(&manager).is_empty());
+        assert_ne!(manager.entries[1].revision, revision);
+        let journal = ["save Home", "rename Office OFFICE", "rename the device key of Office OFFICE", "save OFFICE"];
+        assert_eq!(disk(|disk| disk.journal.clone()), journal);
+        assert_eq!(disk(|disk| disk.files.iter().map(|file| file.0.clone()).collect::<Vec<_>>()), ["OFFICE", "Home"]);
+
+        // removed, with its device key
+        disk(|disk| disk.journal.clear());
+        assert!(remove(&mut manager, "office").ok);
+        assert_eq!(names(&manager), ["Home"]);
+        assert_eq!(disk(|disk| disk.journal.clone()), ["delete OFFICE", "delete the device key of OFFICE"]);
+        assert_eq!(remove(&mut manager, "office").error_code(), ipc::NOT_FOUND);
     }
 
     #[test]
@@ -1357,6 +1864,6 @@ mod tests {
         assert_eq!(manager.sessions(), [1]);
         manager.session_ended(1, "the user signed out");
         assert!(manager.sessions().is_empty());
-        assert!(!manager.list()[0].up);
+        assert!(!manager.list(1)[0].up);
     }
 }

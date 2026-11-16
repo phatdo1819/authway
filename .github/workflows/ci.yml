@@ -1,0 +1,64 @@
+# The checks of every push to main and every pull request, on Windows and macOS: clippy and the tests, for the build
+# of the releases and for the test build (docs/building.md#tests), and the other processor of the packages
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# a new push to the same branch replaces the checks still running
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            other_target: aarch64-pc-windows-msvc
+          - os: macos-latest
+            other_target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup component add clippy
+          rustup target add ${{ matrix.other_target }}
+
+      # the login test listens on 127.0.0.2, which macOS doesn't have by itself
+      - name: A second loopback address
+        if: runner.os == 'macOS'
+        run: sudo ifconfig lo0 alias 127.0.0.2 up
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Clippy of the test build
+        run: cargo clippy --all-targets --features testing -- -D warnings
+
+      - name: Tests
+        run: cargo test
+
+      - name: Tests of the test build
+        run: cargo test --features testing
+
+      - name: The other processor
+        run: cargo check --target ${{ matrix.other_target }}
+

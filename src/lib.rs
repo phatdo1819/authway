@@ -17,6 +17,7 @@ pub mod log;
 pub mod manager;
 pub mod names;
 pub mod product;
+pub mod secret;
 pub mod strings;
 pub mod time;
 pub mod x25519;

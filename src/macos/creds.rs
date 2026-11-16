@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::Page;
 use crate::names;
+use crate::secret::Secret;
 use crate::settings;
 
 // for the log
@@ -16,14 +17,14 @@ const ACCOUNT: &str = "login";
 pub struct SavedLogin {
     pub username: String,
     // None when the user didn't want it saved
-    pub password: Option<String>,
+    pub password: Option<Secret>,
 }
 
 #[derive(Serialize, Deserialize)]
 struct Item {
     username: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    password: Option<String>,
+    password: Option<Secret>,
 }
 
 fn service(page: &Page) -> String {
@@ -49,7 +50,7 @@ pub fn read(page: &Page) -> SavedLogin {
 
 // the username always, the password only when given
 pub fn save(page: &Page, username: &str, password: Option<&str>) -> bool {
-    let item = Item { username: username.to_string(), password: password.map(str::to_string) };
+    let item = Item { username: username.to_string(), password: password.map(Secret::from) };
     let Ok(mut data) = serde_json::to_vec(&item) else { return false };
     let service = service(page);
     let saved = set_generic_password(&service, ACCOUNT, &data).is_ok();

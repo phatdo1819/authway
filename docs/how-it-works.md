@@ -19,6 +19,14 @@ For how to use it, see the [user guide](user-guide.md) and the [administrator gu
   each user talks to it through the pipe `\\.\pipe\Authway`. Users can start the service, not stop it.
 - **The pipe**: signed-in users can read and write it, but can't create another instance of it. The app checks that
   the process at the other end is the service. The service checks the groups of the caller for administrator rights.
+- **A tunnel belongs to the user who turned it on**, by the Windows session of their app. The other users see it
+  on, but its login, its routes and its keys are the owner's: the service refuses them the requests on them, and
+  their apps never look at its login page. They can't turn it off, nor turn on another VPN in its place, unless
+  they can add and remove VPNs (administrators, or everyone with `AllowUserImport`), since they could remove it
+  anyway.
+- **The service never waits on the network with its lock**: when a tunnel turns on, the names of its servers are
+  looked up without it (10 seconds at most each), so the apps of every user get their answers meanwhile. A
+  configuration replaced during the lookups is looked up again.
 - **The setup** is the MSI package of [installer/package.wxs](../installer/package.wxs): the files, the service
   with its rights and restarts, the start at sign-in and the Start menu entry. The exe does the rest with `--msi-...`
   options ([src/setup.rs](../src/setup.rs)): the apps quit before the service stops and start again after the
@@ -80,6 +88,8 @@ line.
 - The tunnel stays on, with its routes, its DNS and its login session (the public IP of the computer doesn't
   change). It goes around the list while none answers. The one that answers stays, and the next connection starts
   with `Endpoint` again.
+- At the connection, the `Endpoint` then the fallbacks are looked up in order, 10 seconds at most each, until one
+  is found: the names after it wait until the tunnel moves to them.
 - A name is looked up again at each change, for 5 seconds at most, else its last address is used. So an `Endpoint`
   name alone also follows a dynamic DNS.
 
@@ -106,13 +116,18 @@ ns-wgauth:
 - Once logged in on a server whose status says `"wireguard_key": "configuration"`, the app asks the service for a new
   WireGuard key. The service makes it with the random generator of the system, keeps it as *pending* with the tunnel
   (encrypted like the configuration: a `Keys` value, or a `<name>.keys` file on macOS), and signs it with the device
-  key ([device::wireguard_key](../src/device.rs)).
-- The app sends it (`POST /api/device-key`). On `200` the service makes it the key of the tunnel, in place, and the
-  next packet makes a handshake.
+  key ([device::wireguard_key](../src/device.rs)). Only while the tunnel works with the key of the configuration
+  file, a handshake proving it: then the firewall has no other key of the tunnel.
+- The app sends it (`POST /api/device-key`). On `200` the app tells the service, which tries the key at once: the
+  next packet makes a handshake. What the app says is only a hint, any program of the user could say it. The key
+  becomes the key of the tunnel with its first handshake, never before; without one, the tunnel goes back to the
+  key of the file.
 - The configuration stays as it was imported, so its key comes back if the firewall takes it again.
 - While a key gets no handshake although packets go out (30 seconds, or 200 for a key that worked), the service
   tries the other keys of the tunnel: the pending one when the firewall's answer was lost, the one of the file after
   a new enrollment. A handshake decides ([src/manager.rs](../src/manager.rs)).
+- A key the firewall may have is never forgotten: the key a new one replaces stays pending, and the service tries it
+  too when the new one stops working.
 - Importing a new file for the VPN forgets the keys made for the old one.
 
 ## macOS
@@ -140,8 +155,10 @@ on Windows ([src/client](../src/client), [src/manager.rs](../src/manager.rs)). W
   use it: one process per tunnel, on a free `utun` interface, configured through its control socket, never with the
   keys on its command line.
 - **The routes** are set as `wg-quick` does: a default route as two halves, the server kept outside the tunnel
-  through the gateway of the network. **The DNS servers** are set on every network service, put back when the tunnel
-  goes off, and at the start of the service after a crash. The service sets them again when the network changes.
+  through the gateway of the network. That route is kept in `host-routes.json` while it's there, and taken back at
+  the start of the service after a crash. **The DNS servers** are set on every network service, put back when the
+  tunnel goes off, and at the start of the service after a crash. The service sets them again when the network
+  changes.
 - **A tunnel belongs to the user who turned it on.** macOS doesn't tell a service when a user logs out, so the app
   lists the tunnels at least every 10 seconds, and the service turns off the tunnels of a user whose app stopped
   asking for 2 minutes.

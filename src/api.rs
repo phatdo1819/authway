@@ -14,11 +14,12 @@ use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
 use std::time::Duration;
 
+use serde::Serialize;
 use serde_json::{Map, Value};
 
 use crate::conf::{Config, IpNet};
 use crate::device::{NewKey, Proof};
-use crate::{log, names, net};
+use crate::{log, names, net, secret};
 
 pub const DEFAULT_PORT: u16 = 8181;
 pub const WEB_PORT: u16 = 80;
@@ -182,8 +183,27 @@ pub fn wants_own_key(status: &ApiResult) -> bool {
 }
 
 pub fn device_key(page: &Page, interface: u32, request: &NewKey) -> ApiResult {
-    let body = serde_json::to_value(request).unwrap_or_default();
-    send("POST", page, interface, "/api/device-key", Some(&body), REQUEST_TIMEOUT)
+    let body = serde_json::to_string(request).unwrap_or_default();
+    send("POST", page, interface, "/api/device-key", Some(body), REQUEST_TIMEOUT)
+}
+
+#[derive(Serialize)]
+struct LoginBody<'a> {
+    username: &'a str,
+    password: &'a str,
+    otp: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device: Option<&'a Proof>,
+}
+
+// The JSON of the login, written once in a buffer big enough for it: a buffer that grows leaves copies of the password
+// in the memory it frees. Every character escaped takes 6 bytes at most, \u0001.
+fn login_body(username: &str, password: &str, otp: &str, device: Option<&Proof>) -> String {
+    let body = LoginBody { username, password, otp, device };
+    let proof = device.map_or(0, |device| serde_json::to_string(device).map_or(0, |text| text.len()));
+    let mut data = Vec::with_capacity(64 + 6 * (username.len() + password.len() + otp.len()) + proof);
+    let _ = serde_json::to_writer(&mut data, &body);
+    String::from_utf8(data).unwrap_or_default()
 }
 
 pub fn login(
@@ -194,11 +214,8 @@ pub fn login(
     otp: &str,
     device: Option<&Proof>,
 ) -> ApiResult {
-    let mut body = serde_json::json!({ "username": username, "password": password, "otp": otp });
-    if let Some(device) = device {
-        body["device"] = serde_json::to_value(device).unwrap_or_default();
-    }
-    send("POST", page, interface, "/api/login", Some(&body), REQUEST_TIMEOUT)
+    let body = login_body(username, password, otp, device);
+    send("POST", page, interface, "/api/login", Some(body), REQUEST_TIMEOUT)
 }
 
 // What the status says of device binding: the challenge to sign and whether the machine ID is required, None when
@@ -213,8 +230,7 @@ pub fn device_challenge(status: &ApiResult) -> Option<(String, bool)> {
 }
 
 pub fn logout(page: &Page, interface: u32, timeout: Option<Duration>) -> ApiResult {
-    let body = serde_json::json!({});
-    send("POST", page, interface, "/api/logout", Some(&body), timeout.unwrap_or(REQUEST_TIMEOUT))
+    send("POST", page, interface, "/api/logout", Some("{}".to_string()), timeout.unwrap_or(REQUEST_TIMEOUT))
 }
 
 // The login page reached through one of the addresses, None if none leads to one. Only an address of the routes
@@ -298,12 +314,16 @@ fn user_agent() -> String {
     format!("{}/{}", names::PRODUCT.replace(' ', "-"), names::VERSION)
 }
 
-fn send(method: &str, page: &Page, interface: u32, path: &str, body: Option<&Value>, timeout: Duration) -> ApiResult {
-    let body = body.map(|body| body.to_string());
-    match exchange(method, page, interface, path, body.as_deref(), "application/json", timeout) {
+// the body, JSON, is wiped once sent: it can hold the password
+fn send(method: &str, page: &Page, interface: u32, path: &str, mut body: Option<String>, timeout: Duration) -> ApiResult {
+    let result = match exchange(method, page, interface, path, body.as_deref(), "application/json", timeout) {
         Ok((status, location, body)) => ApiResult::from_body(status, &body, location),
         Err(error) => ApiResult::unreachable(error.to_string()),
+    };
+    if let Some(body) = body.as_mut() {
+        secret::wipe(body);
     }
+    result
 }
 
 // One request on its own connection through the network adapter of the tunnel, closed by the server after the
@@ -338,7 +358,10 @@ fn exchange(
     if let Some(body) = body {
         request += body;
     }
-    stream.write_all(request.as_bytes())?;
+    let written = stream.write_all(request.as_bytes());
+    // it holds the body, the password with it
+    secret::wipe(&mut request);
+    written?;
     let mut data = Vec::new();
     (&mut stream).take(MAX_RESPONSE + 8192).read_to_end(&mut data)?;
     parse_response(&data)
@@ -433,6 +456,23 @@ mod tests {
         let result = ApiResult::from_body(401, br#"{"error":"invalid_credentials","retry_after":30}"#, None);
         assert_eq!(result.to_string(), "HTTP 401 invalid_credentials");
         assert_eq!(result.get_int("retry_after", 60), 30);
+    }
+
+    #[test]
+    fn the_body_of_the_login() {
+        // quotes, backslashes, a control character escaped in 6 bytes, a letter of 2 bytes
+        let password = "p\"\\\u{1}ß".repeat(20);
+        let body = login_body("alice", &password, "123456", None);
+        let data: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(data["username"], "alice");
+        assert_eq!(data["password"].as_str(), Some(password.as_str()));
+        assert_eq!(data["otp"], "123456");
+        assert!(data.get("device").is_none());
+        // written once, in the buffer made for it: it never grew, leaving a copy behind
+        assert_eq!(body.capacity(), 64 + 6 * ("alice".len() + password.len() + "123456".len()));
+        let proof = Proof { challenge: "C1".into(), ..Proof::default() };
+        let body = login_body("alice", "x", "", Some(&proof));
+        assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["device"]["challenge"], "C1");
     }
 
     #[test]

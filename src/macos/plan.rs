@@ -3,6 +3,8 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+use serde::{Deserialize, Serialize};
+
 use crate::conf::IpNet;
 
 // "add" or "delete" a route
@@ -74,10 +76,41 @@ pub fn route_args(action: Action, net: &IpNet, interface: &str) -> Vec<String> {
 
 // Where the traffic goes when it's not in the tunnel: the router of the network, as route writes it (fe80::1%en0
 // keeps its zone), or a link without one
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct Gateway {
     pub address: Option<String>,
     pub interface: String,
+}
+
+impl Gateway {
+    // the address of a router, fe80::1%en0 with its zone, and the name of an interface: nothing that route would
+    // take for an option
+    fn is_valid(&self) -> bool {
+        let name = |text: &str| !text.is_empty() && text.len() <= 15 && text.chars().all(|c| c.is_ascii_alphanumeric());
+        let router = self.address.as_deref().is_none_or(|address| {
+            let (ip, zone) = address.split_once('%').map_or((address, None), |(ip, zone)| (ip, Some(zone)));
+            ip.parse::<IpAddr>().is_ok() && zone.is_none_or(name)
+        });
+        router && name(&self.interface)
+    }
+}
+
+// A route of a server out of the tunnel, kept in a file while it's there: a service that stopped without taking it
+// back takes it back at its next start
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct HostRoute {
+    pub address: IpAddr,
+    pub gateway: Gateway,
+}
+
+pub fn host_routes_text(routes: &[HostRoute]) -> String {
+    serde_json::to_string_pretty(routes).unwrap_or_default()
+}
+
+// the routes of the file, the valid ones only, none when it isn't one
+pub fn parse_host_routes(data: &[u8]) -> Vec<HostRoute> {
+    let routes = serde_json::from_slice::<Vec<HostRoute>>(data).unwrap_or_default();
+    routes.into_iter().filter(|route| route.gateway.is_valid()).collect()
 }
 
 // The address of a server through the network, never through the tunnel, which it carries: route -q -n add
@@ -237,6 +270,30 @@ mod tests {
         );
         let link = Gateway { address: None, interface: "en5".into() };
         assert_eq!(host_route_args(Action::Delete, "203.0.113.1".parse().unwrap(), &link)[5..], ["-interface", "en5"]);
+    }
+
+    #[test]
+    fn routes_of_the_servers_kept_in_a_file() {
+        let route = |address: &str, router: Option<&str>, interface: &str| HostRoute {
+            address: address.parse().unwrap(),
+            gateway: Gateway { address: router.map(str::to_string), interface: interface.into() },
+        };
+        let routes = vec![
+            route("203.0.113.1", Some("192.168.1.1"), "en0"),
+            route("2001:db8::1", Some("fe80::1%en0"), "en0"),
+            route("198.51.100.7", None, "ppp0"),
+        ];
+        assert_eq!(parse_host_routes(host_routes_text(&routes).as_bytes()), routes);
+        // what route would take for an option is left out
+        let file = r#"[
+            {"address": "203.0.113.1", "gateway": {"address": "-flush", "interface": "en0"}},
+            {"address": "203.0.113.2", "gateway": {"address": "192.168.1.1", "interface": "-x"}},
+            {"address": "203.0.113.3", "gateway": {"address": "fe80::1%-x", "interface": "en0"}},
+            {"address": "203.0.113.4", "gateway": {"address": null, "interface": "en1"}}
+        ]"#;
+        assert_eq!(parse_host_routes(file.as_bytes()), [route("203.0.113.4", None, "en1")]);
+        assert!(parse_host_routes(b"not a list").is_empty());
+        assert!(parse_host_routes(b"").is_empty());
     }
 
     #[test]

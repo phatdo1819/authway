@@ -200,11 +200,7 @@ impl Server {
 
     fn serve_client(&self, pipe: Handle) {
         let response = match ipc::read_message::<Request>(pipe.0) {
-            Ok(request) => {
-                let client = client_of(pipe.0);
-                let mut manager = self.manager.lock().unwrap_or_else(|error| error.into_inner());
-                manager.handle(request, &client)
-            }
+            Ok(request) => manager::handle(&self.manager, request, &client_of(pipe.0)),
             Err(error) => Response::failure(ipc::INVALID, error),
         };
         if let Err(error) = ipc::write_message(pipe.0, &response) {

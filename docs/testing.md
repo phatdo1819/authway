@@ -20,6 +20,22 @@ for the tests only: the service runs as the user (`--service-console`) with fake
 (`HKCU\Software\Authway test`) and its credentials have other names, so it never touches an installed app. On macOS
 its socket is `/tmp/authway-test.sock` and its data `~/Library/Application Support/Authway test`.
 
+## Every push
+
+[The CI](../.github/workflows/ci.yml) runs on every push to `main` and every pull request, on Windows and macOS:
+clippy with its warnings as errors, `cargo test` and `cargo test --features testing`, and a check of the other
+processor of the packages (ARM64 on Windows, Intel on macOS). The unit tests of the service also check, without a
+real tunnel or disk:
+
+- a key the firewall has is never lost: the app saying that the firewall took a new key changes nothing until a
+  handshake comes with it, and the key a new one replaces stays pending;
+- the VPN of another user: its login, routes and keys are refused to the others, administrators too, and only a
+  user who can manage the VPNs can turn it off;
+- the names of the servers are looked up out of the lock of the service, again when the configuration is replaced
+  meanwhile, and at the connection only until one is found, 10 seconds at most each;
+- a VPN added, replaced or removed stays as it was, on too, when the disk refuses;
+- the password of the login is wiped from the memory of the app once sent.
+
 ## The login
 
 The test build ran against the real code of the ns-wgauth daemon: the import, a wrong password then the right one,

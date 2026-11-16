@@ -9,6 +9,7 @@ pub const STATE_FAILED: &str = "can't connect";
 pub const STATE_NO_ANSWER: &str = "the server doesn't answer";
 pub const STATE_UNREACHABLE: &str = "the login page doesn't answer";
 pub const STATE_CONNECTED: &str = "connected";
+pub const STATE_OTHER_USER: &str = "connected by another user of this computer";
 pub const STATE_NEED_LOGIN: &str = "waiting for the login";
 pub const STATE_BLOCKED: &str = "configuration blocked";
 pub const STATE_NO_USER: &str = "configuration not linked to a user";
