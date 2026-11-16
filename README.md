@@ -1,6 +1,7 @@
 # Authway
 
-A WireGuard VPN client for Windows 10 and 11, and macOS 15 or later, that can log in by itself. When the server
+A WireGuard VPN client for Windows 10 and 11, macOS 15 or later, and Linux (Debian 12, Ubuntu 22.04, RHEL 9 and
+later), that can log in by itself. When the server
 requires it, Authway logs in with a username, a password and an authenticator code, then keeps watching the session.
 
 It's made for NethSecurity firewalls with the WireGuard login of
@@ -35,7 +36,7 @@ other WireGuard server, without the login.
 2. Click **Add VPN** and choose the `.conf` file from your administrator.
 3. Turn on the switch of the VPN, and log in when asked.
 
-On a Mac, see [macOS](#macos).
+On a Mac, see [macOS](#macos); on Linux, see [Linux](#linux).
 
 Good to know:
 
@@ -58,9 +59,27 @@ The same app, for Apple silicon and Intel. It has only run in a macOS virtual ma
 
 To remove it: `sudo "/Library/Application Support/Authway/uninstall.sh"`.
 
+## Linux
+
+The same app, with GTK: an icon in the tray, the main window and the login window. It needs Linux 5.7 or later, with
+WireGuard in the kernel: Debian 12, Ubuntu 22.04, RHEL 9 (Rocky, AlmaLinux) and later, Fedora. It was only checked to
+compile and its logic tested on Windows: expect bugs, and please report them.
+
+1. Download `authway_<version>_amd64.deb` (Debian, Ubuntu) or `authway-<version>-1.x86_64.rpm` (RHEL, Fedora) from the
+   [releases](https://github.com/phatdo1819/authway/releases) and install it: `sudo apt install ./authway_*.deb`, or
+   `sudo dnf install ./authway-*.rpm`. On RHEL, the tray icon needs EPEL for `libayatana-appindicator-gtk3`.
+2. Then as on Windows. **Authway** is in the menu of the applications, and in the tray once started.
+
+On GNOME (the desktop of Debian and RHEL), the tray icon needs the
+[AppIndicator extension](https://extensions.gnome.org/extension/615/appindicator-support/); Ubuntu has it already.
+Without it, the window stays in the taskbar instead.
+
+To remove it: `sudo apt purge authway`, or `sudo dnf remove authway`.
+
 ## For the administrators
 
-- Deploy the MSI with Intune, Group Policy or any MSI tool, and the macOS package with `installer`.
+- Deploy the MSI with Intune, Group Policy or any MSI tool, the macOS package with `installer`, and the Linux
+  packages with `apt` or `dnf`.
 - Add VPNs without windows with `authway --import`, and fill in the login for the user.
 - Choose with policies who can add VPNs and whether passwords are saved.
 - Read the pros and cons of device binding before turning it on.
@@ -89,14 +108,17 @@ See [Building](docs/building.md).
 - Tested in virtual machines only: not on physical computers, nor with a firewall in production.
 - The login and device binding need the ns-wgauth firewall of the NethSecurity fork, with a local users database.
 - No kill switch: when the tunnel is down, the traffic goes out without it. DNS outside the tunnel isn't blocked.
-- The packages aren't signed by a known publisher, so Windows and macOS warn before installing them.
+- The packages aren't signed by a known publisher, so Windows and macOS warn before installing them. The Linux
+  packages aren't signed either, nor in a repository.
+- Linux: checked to compile and its logic tested, never run yet on a real computer. GNOME needs an extension for the
+  tray icon.
 - No automatic updates: install each new version by hand or with your deployment tool.
 - The VPNs don't reconnect by themselves at sign-in.
 - The VPNs belong to the computer, not to a user: every user of the computer can connect them. The saved passwords
   stay with each user, and a VPN that is on stays the one of the user who connected it: the others can't log in on
   it, nor disconnect it unless they can add and remove VPNs.
 - English only.
-- Device binding uses software keys, not the TPM or the Secure Enclave.
+- Device binding uses software keys, not the TPM or the Secure Enclave (on Linux, OpenSSL keys readable by root only).
 - No iOS or Android app.
 
 ## Contributing

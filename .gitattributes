@@ -1,3 +1,5 @@
 # the scripts and files of the macOS package run on macOS: never CRLF
 *.sh text eol=lf
 installer/macos/* text eol=lf
+# the same for the files of the Linux packages: scripts, unit, spec and desktop files
+installer/linux/** text eol=lf

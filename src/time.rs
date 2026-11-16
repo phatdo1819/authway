@@ -151,6 +151,44 @@ pub fn timestamp() -> String {
     local::timestamp()
 }
 
+#[cfg(target_os = "linux")]
+mod local {
+    fn local(unix: u64) -> libc::tm {
+        let mut local: libc::tm = unsafe { std::mem::zeroed() };
+        let seconds = unix as libc::time_t;
+        unsafe { libc::localtime_r(&seconds, &mut local) };
+        local
+    }
+
+    fn now() -> u64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |time| time.as_secs())
+    }
+
+    // the time alone today, else the date before it, in the order of ISO 8601 that every language reads
+    pub fn format(unix: u64) -> String {
+        let (time, today) = (local(unix), local(now()));
+        let clock = format!("{:02}:{:02}", time.tm_hour, time.tm_min);
+        if (time.tm_year, time.tm_yday) == (today.tm_year, today.tm_yday) {
+            return clock;
+        }
+        format!("{:04}-{:02}-{:02} {}", time.tm_year + 1900, time.tm_mon + 1, time.tm_mday, clock)
+    }
+
+    // "2026-10-25 18:30:00", for the logs
+    pub fn timestamp() -> String {
+        let local = local(now());
+        format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+            local.tm_year + 1900,
+            local.tm_mon + 1,
+            local.tm_mday,
+            local.tm_hour,
+            local.tm_min,
+            local.tm_sec
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

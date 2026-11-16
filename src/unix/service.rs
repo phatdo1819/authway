@@ -1,6 +1,7 @@
-// The service on macOS, a launchd job as root: it keeps the configurations of the tunnels and turns them on and off
-// for the app of the users, through its socket. The session of a tunnel is the user who turned it on; macOS doesn't
-// tell a service when a user logs out, so a tunnel goes off when the app of its user stops asking for the list.
+// The service on macOS and Linux, as root: a launchd job, or a systemd unit. It keeps the configurations of the
+// tunnels and turns them on and off for the app of the users, through its socket. The session of a tunnel is the
+// user who turned it on; neither system tells a service when a user logs out, so a tunnel goes off when the app of
+// its user stops asking for the list.
 
 use std::collections::HashMap;
 use std::fs;
@@ -28,7 +29,7 @@ const REQUEST_TIME: Duration = Duration::from_secs(10);
 
 #[cfg(not(feature = "testing"))]
 fn engine() -> Box<dyn Engine> {
-    Box::new(crate::wg::GoEngine)
+    crate::wg::engine()
 }
 
 #[cfg(feature = "testing")]
@@ -174,7 +175,10 @@ fn serve(started: &str) -> i32 {
     let signals = block_signals();
     log::init(log_path());
     log!("{} {}: {}", names::PRODUCT, names::VERSION, started);
-    // the DNS servers and the routes of the servers of a service that stopped without taking them back
+    // the tunnels, the DNS servers and the routes of the servers of a service that stopped without taking them back
+    if !cfg!(feature = "testing") {
+        crate::wg::clean_up();
+    }
     net::restore_dns_backup();
     net::restore_host_routes();
     let listener = match bind() {
@@ -203,10 +207,10 @@ fn serve(started: &str) -> i32 {
     0
 }
 
-// Started by launchd: --service
+// Started by launchd or systemd: --service
 pub fn run() -> i32 {
     if unsafe { libc::geteuid() } != 0 {
-        eprintln!("this is the service of {}: launchd starts it as root", names::PRODUCT);
+        eprintln!("this is the service of {}: the system starts it as root", names::PRODUCT);
         return 1;
     }
     serve("service started")

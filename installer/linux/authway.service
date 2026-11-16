@@ -1,0 +1,27 @@
+# The service of @PRODUCT@, as root, from the start of the computer: /usr/lib/systemd/system/@LOWER@.service. It owns
+# the tunnels; the app of each user turns them on and off through its socket, /run/@LOWER@.sock.
+[Unit]
+Description=@PRODUCT@ tunnels
+Documentation=https://github.com/phatdo1819/authway
+After=network-online.target systemd-resolved.service NetworkManager.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/@EXECUTABLE@ --service
+Restart=on-failure
+RestartSec=5
+# the time to log out, turn the tunnels off and put the DNS servers back
+TimeoutStopSec=30
+# its folders: the tunnels and the device keys for root only, the log for everyone
+StateDirectory=@LOWER@
+StateDirectoryMode=0700
+LogsDirectory=@LOWER@
+LogsDirectoryMode=0755
+# what it never needs
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target

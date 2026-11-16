@@ -1,5 +1,5 @@
-// The configurations of the tunnels on macOS: one file each in a folder of root, as /etc/wireguard, readable by
-// root only. The users can't read the private keys back, only the service can.
+// The configurations of the tunnels on macOS and Linux: one file each in a folder of root, as /etc/wireguard,
+// readable by root only. The users can't read the private keys back, only the service can.
 
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::Write;
@@ -10,7 +10,7 @@ use crate::conf;
 use crate::log;
 use crate::setup;
 
-// nothing more than its name: macOS gives the interface of a tunnel a new name at every connection
+// nothing more than its name: the interface of a tunnel gets a new name at every connection
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Id;
 

@@ -1,0 +1,11 @@
+// The users signed in on this computer can start the service of @PRODUCT@ when it stopped, as on Windows; only the
+// administrators can stop it or change it. /usr/share/polkit-1/rules.d/50-@LOWER@.rules, for polkit 0.106 and later:
+// with an older one, polkit asks for an administrator instead.
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.systemd1.manage-units" &&
+        action.lookup("unit") == "@LOWER@.service" &&
+        action.lookup("verb") == "start" &&
+        subject.local && subject.active) {
+        return polkit.Result.YES;
+    }
+});

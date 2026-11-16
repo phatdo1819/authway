@@ -61,6 +61,17 @@ The packages are in the [releases](https://github.com/phatdo1819/authway/release
   that the server doesn't answer. On a new computer, after a reinstall or after removing the VPN, ask your
   administrator to allow a new device, then add the VPN again from its file.
 
+## On Linux
+
+The same window, menu and login as on Windows, with these differences:
+
+- The app is in the tray. On GNOME (Debian, RHEL), the tray needs the AppIndicator extension; without it, closing
+  the window leaves it in the taskbar, the way back to the app.
+- The window follows the theme of the desktop, light or dark.
+- Every user can add VPNs without an administrator password, unless the administrator chose otherwise; else the
+  system asks for it.
+- **Remember my password** saves it in the keyring of the desktop. Without a keyring, only the username is saved.
+
 ## On a Mac
 
 The same window, menu and login as on Windows, with these differences:

@@ -63,13 +63,25 @@ pub fn run_value() -> String {
     format!("{}{}", PRODUCT, suffix())
 }
 
-// macOS: the socket of the service, in a folder only root can write to, so no other program takes its name
+// macOS and Linux: the socket of the service, in a folder only root can write to, so no other program takes its name
 pub fn socket_path() -> String {
     if cfg!(feature = "testing") {
         format!("/tmp/{}-test.sock", PRODUCT.to_lowercase())
+    } else if cfg!(target_os = "linux") {
+        format!("/run/{}.sock", PRODUCT.to_lowercase())
     } else {
         format!("/var/run/{}.sock", PRODUCT.to_lowercase())
     }
+}
+
+// Linux: the systemd unit of the service, and the prefix of the names of the network interfaces of the tunnels, 15
+// characters at most with their number
+pub fn unit_name() -> String {
+    format!("{}.service", PRODUCT.to_lowercase())
+}
+
+pub fn interface_prefix() -> String {
+    PRODUCT.to_lowercase().chars().filter(char::is_ascii_alphanumeric).take(10).collect()
 }
 
 // the launchd jobs: the service, as root, and the app, at every login

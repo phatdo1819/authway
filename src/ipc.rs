@@ -29,7 +29,7 @@ use crate::names;
 #[cfg(windows)]
 use crate::win::{error_message, last_error, wide, Handle};
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 pub use unix::{call, peer_uid, read_from, write_to};
 
 pub const MAX_MESSAGE: usize = 1024 * 1024;
@@ -363,8 +363,9 @@ pub fn call(request: &Request) -> Result<Response, CallError> {
     read_message(pipe.0).map_err(CallError::Failed)
 }
 
-// The socket of the service: only root can create it where it is, and the app checks that root answers
-#[cfg(target_os = "macos")]
+// The socket of the service, on macOS and Linux: only root can create it where it is, and the app checks that root
+// answers
+#[cfg(unix)]
 mod unix {
     use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
@@ -402,9 +403,27 @@ mod unix {
     }
 
     // the user at the other end of a connection
+    #[cfg(target_os = "macos")]
     pub fn peer_uid(stream: &UnixStream) -> Option<u32> {
         let (mut uid, mut gid) = (0, 0);
         (unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } == 0).then_some(uid)
+    }
+
+    // the user of the process at the other end of a connection, as the kernel saw it connect
+    #[cfg(target_os = "linux")]
+    pub fn peer_uid(stream: &UnixStream) -> Option<u32> {
+        let mut credentials = libc::ucred { pid: 0, uid: 0, gid: 0 };
+        let mut size = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        let result = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                &mut credentials as *mut libc::ucred as *mut libc::c_void,
+                &mut size,
+            )
+        };
+        (result == 0 && size as usize == std::mem::size_of::<libc::ucred>()).then_some(credentials.uid)
     }
 
     fn check_server(stream: &UnixStream) -> Result<(), CallError> {

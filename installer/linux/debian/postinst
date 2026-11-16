@@ -1,0 +1,10 @@
+#!/bin/sh
+# After the installation or an update: the service, at every start of the computer and now. An update restarts it
+# with the new program: its tunnels go off, the app of each user turns them on again at its next start.
+set -e
+if [ "$1" = "configure" ] && [ -d /run/systemd/system ]; then
+    systemctl daemon-reload || true
+    systemctl enable @LOWER@.service || true
+    systemctl restart @LOWER@.service || true
+fi
+exit 0

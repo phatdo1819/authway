@@ -58,8 +58,8 @@ fn main() {
             setup::remove_user_data();
             0
         }
-        // run by uninstall.sh as each user
-        #[cfg(target_os = "macos")]
+        // run by uninstall.sh as each user on macOS; by the user on Linux, whose packages leave the homes alone
+        #[cfg(unix)]
         Some("--remove-user-data") => {
             setup::remove_user_data();
             0

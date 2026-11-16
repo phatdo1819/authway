@@ -1,0 +1,7 @@
+#!/bin/sh
+# Before the removal, not an update: the service stops, the tunnels go off with their routes and DNS servers
+set -e
+if [ "$1" = "remove" ] && [ -d /run/systemd/system ]; then
+    systemctl disable --now @LOWER@.service || true
+fi
+exit 0

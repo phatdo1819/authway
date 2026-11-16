@@ -168,3 +168,45 @@ on Windows ([src/client](../src/client), [src/manager.rs](../src/manager.rs)). W
   keychain of the user, under `Authway/http://10.103.1.1:8181`.
 - **The logs**: `~/Library/Logs/Authway/client.log` for the app, `/Library/Logs/Authway/service.log` for the service
   and `wireguard-go`.
+
+## Linux
+
+```
+ the user                                   root (systemd)
+┌──────────────────────┐  Unix socket   ┌────────────────────────┐   ip, wg (stdin)  ┌──────────────┐
+│ authway              │◄──────────────►│ authway --service      │◄─────────────────►│ WireGuard of │
+│ GTK 3: tray, window, │  JSON, a line  │ /usr/bin, unit         │                   │ the kernel,  │
+│ login                │                │ authway.service        │                   │ authwayN     │
+└──────────────────────┘                └────────────────────────┘                   └──────────────┘
+```
+
+The window, the menu, the login, the details, the fallback addresses and the two steps come from the same code as on
+Windows and macOS; the service and the store of the configurations are the ones of macOS
+([src/unix](../src/unix)). What differs is in [src/linux](../src/linux), with the arguments of the commands and what
+their outputs say in [commands.rs](../src/linux/commands.rs), tested on every system:
+
+- **The app** loads GTK 3, AppIndicator (the tray, StatusNotifierItem) and libnotify when it starts, with `dlopen`:
+  the service and the commands run without them, on a server too, and the build needs none of their development
+  files. Without a tray (GNOME without its extension), the main window stays in the taskbar.
+- **The service** is a systemd unit, as root, with `/var/lib/authway` for root only and `/var/log/authway`. It
+  listens on `/run/authway.sock`; the app checks that root owns it, and the service knows the user of each request
+  from the kernel (`SO_PEERCRED`).
+- **The tunnels** are interfaces of the WireGuard of the kernel (Linux 5.6 and later), `authway0` and on, made by
+  `ip` and configured by `wg` of `wireguard-tools`: the keys on its standard input, never on its command line. The
+  interfaces that a service that stopped left are removed at its next start.
+- **The routes** are set as on macOS: a default route as two halves, the server kept outside the tunnel through the
+  gateway of the network, in `host-routes.json` while it's there.
+- **The DNS servers**: on the interface of the tunnel with systemd-resolved (`resolvectl`, routing domain `~.`, for
+  every name), which forgets them with the interface. Without it, `/etc/resolv.conf` is replaced, the one of before
+  kept in `resolv.conf.backup` and put back when the tunnel goes off, or at the start of the service after a crash.
+- **The login only through the tunnel**: `SO_BINDTODEVICE`, which needs no privilege since Linux 5.7, then the same
+  check of the address as on the other systems.
+- **The device keys**: P-256 keys made by `openssl`, the cryptography of the system, in `devices/<name>.key`, for
+  root only; openssl signs the data given on its standard input. The ID of the computer: the SMBIOS UUID, else
+  `/etc/machine-id`.
+- **The passwords** are in the keyring of the user (GNOME Keyring or KWallet) through `secret-tool`, the item as JSON
+  on its standard input.
+- **Adding and removing VPNs** is allowed to root, or to every user with `AllowUserImport` in
+  `/etc/authway/policy.conf` (the package's default). Otherwise the app asks pkexec for an administrator and runs the
+  same `--import` as root.
+- **The logs**: `~/.local/state/authway/client.log` for the app, `/var/log/authway/service.log` for the service.

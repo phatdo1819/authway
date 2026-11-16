@@ -1,0 +1,15 @@
+Package: @LOWER@
+Version: @VERSION@
+Architecture: @ARCH@
+Maintainer: @MAINTAINER@
+Installed-Size: @SIZE@
+Depends: wireguard-tools, iproute2, openssl, systemd, pkexec | policykit-1, libgtk-3-0t64 | libgtk-3-0
+Recommends: libayatana-appindicator3-1 | libappindicator3-1, libnotify4, libsecret-tools, xdg-utils
+Section: net
+Priority: optional
+Homepage: https://github.com/phatdo1819/authway
+Description: WireGuard VPN client that logs in to the servers that require it
+ @PRODUCT@ connects to WireGuard servers, and logs in with a username, a password
+ and an authenticator code to the ones that require it (ns-wgauth of NethSecurity),
+ then keeps watching the session. Device binding, fallback addresses, an icon in the
+ tray and a main window. It needs Linux 5.7 or later, with WireGuard in the kernel.

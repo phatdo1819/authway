@@ -1,9 +1,9 @@
 [package]
 name = "authway"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
-description = "A WireGuard VPN client for Windows and macOS that logs in to the servers that require it"
+description = "A WireGuard VPN client for Windows, macOS and Linux that logs in to the servers that require it"
 publish = false
 
 [features]
@@ -68,6 +68,11 @@ dispatch2 = "0.3.1"
 security-framework = "3.7.0"
 security-framework-sys = "2.17.0"
 core-foundation = "0.10.1"
+
+# GTK 3, its tray icon (AppIndicator) and its notices (libnotify) are loaded when the app starts, not linked: the
+# service runs without them, on a server too, and the build needs none of their development files
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 
 [build-dependencies]
 embed-resource = "3.0.12"

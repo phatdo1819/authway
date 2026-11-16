@@ -6,6 +6,7 @@ branch of the NethSecurity fork: steps 1–7 for the login, 8 for the fallback a
 
 - [Windows](#windows)
 - [macOS](#macos)
+- [Linux](#linux)
 - [Device binding: pros and cons](#device-binding-pros-and-cons)
 - [Logs](#logs)
 
@@ -17,11 +18,11 @@ The MSI package installs for the whole computer, so Intune, Group Policy or any 
 install it. As administrator, without windows:
 
 ```
-msiexec /i authway-0.2.1-x64-unsigned.msi /qn
+msiexec /i authway-0.3.0-x64-unsigned.msi /qn
 "C:\Program Files\Authway\authway.exe" --import "C:\path\office.conf" --name "Office"
 "C:\Program Files\Authway\authway.exe" --rename "Office" --to "Head office"
 "C:\Program Files\Authway\authway.exe" --remove "Office"
-msiexec /x authway-0.2.1-x64-unsigned.msi /qn
+msiexec /x authway-0.3.0-x64-unsigned.msi /qn
 ```
 
 | | |
@@ -75,7 +76,7 @@ reg add "HKLM\SOFTWARE\Policies\Authway" /v AllowUserImport /t REG_DWORD /d 1 /f
 ## macOS
 
 ```
-sudo installer -pkg authway-0.2.1-macos-unsigned.pkg -target /
+sudo installer -pkg authway-0.3.0-macos-unsigned.pkg -target /
 sudo /Applications/Authway.app/Contents/MacOS/authway --import ~/Downloads/office.conf --name "Office"
 sudo /Applications/Authway.app/Contents/MacOS/authway --remove "Office"
 sudo "/Library/Application Support/Authway/uninstall.sh"
@@ -104,6 +105,41 @@ sudo "/Library/Application Support/Authway/uninstall.sh"
   sudo defaults write /Library/Preferences/io.authway.client AllowUserImport -bool false
   sudo defaults write /Library/Preferences/io.authway.client RememberPassword -bool false
   ```
+
+## Linux
+
+Debian 12, Ubuntu 22.04, RHEL 9 (Rocky, AlmaLinux) and later, Fedora: Linux 5.7 or later, with WireGuard in the
+kernel. The packages need `wireguard-tools`, `iproute2`, `openssl` and GTK 3; on RHEL, EPEL for the tray icon
+(`libayatana-appindicator-gtk3`).
+
+```
+sudo apt install ./authway_0.3.0_amd64.deb            # or: sudo dnf install ./authway-0.3.0-1.x86_64.rpm
+sudo authway --import ~/Downloads/office.conf --name "Office"
+sudo authway --rename "Office" --to "Head office"
+sudo authway --remove "Office"
+sudo apt purge authway                                 # or: sudo dnf remove authway
+```
+
+- **Install**: the service (`authway.service`, systemd) starts at once and with every start of the computer; the app
+  at every sign-in (`/etc/xdg/autostart`), and from the menu of the applications.
+- **Fill in the login**: as on macOS, **without sudo**, as the user: the login goes to their keyring (GNOME Keyring
+  or KWallet, through `secret-tool`). Without a keyring the username is saved, not the password.
+- **Update**: install the new package over the old one. The VPNs are kept; the service restarts, so a VPN that was on
+  goes off until the app of its user starts again.
+- **Remove**: `apt remove` keeps the VPNs, `apt purge` removes them with their device keys and the logs. `dnf remove`
+  removes them. The settings and passwords of each user stay in their home: `authway --remove-user-data`, as them.
+- **Policies**: `/etc/authway/policy.conf`, read again at each request, kept by updates:
+
+  ```
+  AllowUserImport = 0      # only administrators add, rename and remove VPNs (the package writes 1)
+  RememberPassword = 0     # the app never saves the passwords
+  ```
+
+  A user who isn't allowed is asked for the password of an administrator by pkexec. The users can start the service
+  when it stopped, through a rule of polkit (`/usr/share/polkit-1/rules.d/50-authway.rules`).
+- **DNS**: with systemd-resolved (Ubuntu, Fedora), the DNS servers of the VPN go on its interface, for every name.
+  Without it (Debian, RHEL), `/etc/resolv.conf` is replaced while the VPN is on, and put back after; when
+  NetworkManager writes it again, the app writes the VPN's again within 5 seconds.
 
 ## Device binding: pros and cons
 
@@ -169,3 +205,4 @@ The logs have no passwords, codes or keys:
 |---|---|---|
 | Windows (**⋯ > Logs**) | `%LOCALAPPDATA%\Authway\client.log` | `C:\Program Files\Authway\log\service.log` |
 | macOS (**Logs** opens Console) | `~/Library/Logs/Authway/client.log` | `/Library/Logs/Authway/service.log` |
+| Linux (**⋯ > Logs**) | `~/.local/state/authway/client.log` | `/var/log/authway/service.log` |

@@ -45,6 +45,28 @@ tools/dist-macos.sh              # dist/authway-<version>-macos.pkg
 - With ad-hoc signatures, macOS can ask again for the saved passwords after an update: the keychain knows the app by
   its signature.
 
+## Linux
+
+On Debian, Ubuntu, RHEL or Fedora, as a normal user. The script installs what's missing, with sudo: gcc for the
+linker, `dpkg-deb` and `rpmbuild` (the package `rpm` on Debian and Ubuntu), the cross compiler for ARM64, and Rust
+1.87 or later with rustup, for the user (the Rust of the distributions is too old). No development files of GTK: the
+app loads it when it starts.
+
+```
+tools/dist-linux.sh     # dist/authway_<version>_amd64.deb and dist/authway-<version>-1.x86_64.rpm
+```
+
+- `NO_INSTALL=1 tools/dist-linux.sh` installs nothing and says what's missing.
+- On RHEL, `dpkg` is only in EPEL: without it, the script builds the .rpm alone.
+
+- Build the packages on the oldest system they're for, Debian 12 or RHEL 9 (a container is enough): a program takes
+  the versions of glibc of the system that builds it.
+- For ARM64: `TARGET=aarch64-unknown-linux-gnu tools/dist-linux.sh`, on ARM64, or from x86_64 on Debian or Ubuntu,
+  where the script installs the cross compiler and sets it as the linker.
+- The field Maintainer of the .deb: `MAINTAINER="Name <address>" tools/dist-linux.sh`.
+- From Windows or macOS, `cargo clippy --target x86_64-unknown-linux-gnu --all-targets` checks the Linux code, and
+  `cargo test` runs the tests of [commands.rs](../src/linux/commands.rs) there too.
+
 ## Tests
 
 ```

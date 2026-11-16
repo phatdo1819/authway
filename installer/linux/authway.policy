@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!-- What pkexec says when the app adds, renames or removes a VPN as root, for a user who isn't allowed to by
+     /etc/@LOWER@/policy.conf: /usr/share/polkit-1/actions/@BUNDLE_ID@.policy -->
+<policyconfig>
+  <vendor>@PRODUCT@</vendor>
+  <action id="@BUNDLE_ID@.manage">
+    <description>Add, rename or remove a VPN of @PRODUCT@</description>
+    <message>@PRODUCT@ wants to change the VPNs of this computer.</message>
+    <icon_name>@LOWER@</icon_name>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/bin/@EXECUTABLE@</annotate>
+  </action>
+</policyconfig>

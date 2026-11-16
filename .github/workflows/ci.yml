@@ -1,5 +1,7 @@
-# The checks of every push to main and every pull request, on Windows and macOS: clippy and the tests, for the build
-# of the releases and for the test build (docs/building.md#tests), and the other processor of the packages
+# The checks of every push to main and every pull request, on Windows, macOS and Linux: clippy and the tests, for the
+# build of the releases and for the test build (docs/building.md#tests), and the other processor of the packages. On
+# Linux, the .deb and the .rpm too: the .deb installed on Ubuntu, its service started, a VPN added and removed; the
+# .rpm installed on Rocky Linux 9, for its dependencies.
 name: CI
 
 on:
@@ -62,3 +64,72 @@ jobs:
       - name: The other processor
         run: cargo check --target ${{ matrix.other_target }}
 
+  linux:
+    name: ubuntu-latest
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup component add clippy
+          rustup target add aarch64-unknown-linux-gnu
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Clippy of the test build
+        run: cargo clippy --all-targets --features testing -- -D warnings
+
+      - name: Tests
+        run: cargo test
+
+      - name: Tests of the test build
+        run: cargo test --features testing
+
+      - name: The other processor
+        run: cargo check --target aarch64-unknown-linux-gnu
+
+      # the script installs what it needs: rpmbuild here
+      - name: The packages
+        run: sh tools/dist-linux.sh
+
+      # the service as the package installs it: started by systemd, a VPN added and removed by root
+      - name: The .deb installed
+        run: |
+          sudo apt-get install -y ./dist/authway_*_amd64.deb
+          systemctl is-active authway.service
+          test -S /run/authway.sock
+          key=$(head -c 32 /dev/urandom | base64)
+          peer=$(head -c 32 /dev/urandom | base64)
+          printf '[Interface]\nPrivateKey = %s\nAddress = 10.103.1.2/24\n[Peer]\nPublicKey = %s\nAllowedIPs = 10.103.1.0/24\nEndpoint = 192.0.2.1:51820\n' "$key" "$peer" > ci.conf
+          sudo authway --import ci.conf --name CI
+          sudo test -f /var/lib/authway/tunnels/CI.conf
+          sudo authway --remove CI
+          sudo test ! -e /var/lib/authway/tunnels/CI.conf
+          sudo cat /var/log/authway/service.log
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-packages
+          path: dist/*
+
+  rpm:
+    name: rockylinux-9
+    needs: linux
+    runs-on: ubuntu-latest
+    container: rockylinux:9
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-packages
+
+      - name: The .rpm installed, with its dependencies
+        run: |
+          dnf install -y ./authway-*.x86_64.rpm
+          rpm -ql authway
+          authway --remove nothing || test $? -eq 1

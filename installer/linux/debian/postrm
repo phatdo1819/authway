@@ -1,0 +1,11 @@
+#!/bin/sh
+# After the removal: with "purge", the tunnels, the device keys, the logs and the settings of the administrator go
+# too. The settings and the passwords of the users stay in their homes: authway --remove-user-data, as each of them.
+set -e
+if [ "$1" = "purge" ]; then
+    rm -rf /var/lib/@LOWER@ /var/log/@LOWER@ /etc/@LOWER@
+fi
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload || true
+fi
+exit 0

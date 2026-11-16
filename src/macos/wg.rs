@@ -216,6 +216,14 @@ impl Tunnel for GoTunnel {
     }
 }
 
+pub fn engine() -> Box<dyn Engine> {
+    Box::new(GoEngine)
+}
+
+// At the start of the service: nothing to do, launchd ends the wireguard-go of a service that stopped, and their
+// interfaces go with them
+pub fn clean_up() {}
+
 pub struct GoEngine;
 
 impl Engine for GoEngine {

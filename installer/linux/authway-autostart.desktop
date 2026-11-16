@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=@PRODUCT@
+Comment=The tray icon of @PRODUCT@ and its VPN logins, at every sign-in
+Exec=@EXECUTABLE@ --startup
+Icon=@LOWER@
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

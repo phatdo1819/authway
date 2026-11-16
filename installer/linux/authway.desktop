@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=@PRODUCT@
+GenericName=VPN client
+Comment=Connect to the VPNs of your organization, and log in to them
+Exec=@EXECUTABLE@
+Icon=@LOWER@
+Terminal=false
+Categories=Network;
+Keywords=VPN;WireGuard;login;
+StartupNotify=false

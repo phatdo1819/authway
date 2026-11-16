@@ -169,7 +169,7 @@ pub enum Way {
 }
 
 impl Way {
-    fn interface(&self) -> &str {
+    pub fn interface(&self) -> &str {
         match self {
             Way::Gateway(gateway) => &gateway.interface,
             Way::Local(interface) => interface,

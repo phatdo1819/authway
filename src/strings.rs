@@ -129,8 +129,10 @@ pub fn notice_failed(server: &str, reason: &str) -> String {
 // where the icon of the app is
 #[cfg(windows)]
 const PLACE: &str = "next to the clock";
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
 const PLACE: &str = "in the menu bar";
+#[cfg(not(any(windows, target_os = "macos")))]
+const PLACE: &str = "in the system tray";
 #[cfg(windows)]
 const OPEN_MENU: &str = "right-click the icon";
 #[cfg(not(windows))]
@@ -138,8 +140,10 @@ const OPEN_MENU: &str = "click the icon";
 // how the system asks for an administrator
 #[cfg(windows)]
 const ADMIN_PROMPT: &str = "Windows will ask for the permission.";
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
 const ADMIN_PROMPT: &str = "macOS will ask for the name and password of an administrator.";
+#[cfg(not(any(windows, target_os = "macos")))]
+const ADMIN_PROMPT: &str = "The system will ask for the password of an administrator.";
 
 pub fn notice_welcome() -> String {
     format!("{} is {}. Add your VPN from the file of your administrator: {}.", PRODUCT, PLACE, OPEN_MENU)
@@ -266,7 +270,26 @@ pub fn not_installed() -> String {
     )
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
+pub fn not_installed() -> String {
+    format!(
+        "{} isn't installed on this computer. Install it with its .deb or .rpm package: the system asks for the \
+         password of an administrator, once.",
+        PRODUCT
+    )
+}
+
+// in the system tray: where the desktop has one. GNOME needs an extension for it.
+#[cfg(not(any(windows, target_os = "macos")))]
+pub fn notice_no_tray() -> String {
+    format!(
+        "{} keeps running in the taskbar: this desktop shows no tray icon. On GNOME, the AppIndicator extension \
+         shows its icon in the top bar.",
+        PRODUCT
+    )
+}
+
+#[cfg(target_os = "macos")]
 pub fn not_installed() -> String {
     format!(
         "{} isn't installed on this Mac. Install it with its .pkg file: macOS asks for the password of an \
