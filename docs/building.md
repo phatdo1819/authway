@@ -49,7 +49,7 @@ tools/dist-macos.sh              # dist/authway-<version>-macos.pkg
 
 On Debian, Ubuntu, RHEL or Fedora, as a normal user. The script installs what's missing, with sudo: gcc for the
 linker, `dpkg-deb` and `rpmbuild` (the package `rpm` on Debian and Ubuntu), the cross compiler for ARM64, and Rust
-1.87 or later with rustup, for the user (the Rust of the distributions is too old). No development files of GTK: the
+1.88 or later with rustup, for the user (the Rust of the distributions is too old). No development files of GTK: the
 app loads it when it starts.
 
 ```

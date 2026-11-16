@@ -20,6 +20,9 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # The Rust of the CI, the one the code was last checked with: each release of Rust brings new lints of clippy, which
+  # fail the build with -D warnings. Moving to a newer one is a change of its own, with the fixes its lints ask for.
+  RUST: 1.96.0
 
 jobs:
   check:
@@ -39,9 +42,8 @@ jobs:
 
       - name: Rust
         run: |
-          rustup update stable --no-self-update
-          rustup default stable
-          rustup component add clippy
+          rustup toolchain install ${{ env.RUST }} --profile minimal --component clippy --no-self-update
+          rustup default ${{ env.RUST }}
           rustup target add ${{ matrix.other_target }}
 
       # the login test listens on 127.0.0.2, which macOS doesn't have by itself
@@ -73,9 +75,8 @@ jobs:
 
       - name: Rust
         run: |
-          rustup update stable --no-self-update
-          rustup default stable
-          rustup component add clippy
+          rustup toolchain install ${{ env.RUST }} --profile minimal --component clippy --no-self-update
+          rustup default ${{ env.RUST }}
           rustup target add aarch64-unknown-linux-gnu
 
       - name: Clippy

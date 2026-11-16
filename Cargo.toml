@@ -2,6 +2,8 @@
 name = "authway"
 version = "0.3.0"
 edition = "2021"
+# slice::as_chunks
+rust-version = "1.88"
 license = "MIT"
 description = "A WireGuard VPN client for Windows, macOS and Linux that logs in to the servers that require it"
 publish = false

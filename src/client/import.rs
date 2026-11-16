@@ -18,7 +18,7 @@ fn read_config(path: &Path) -> Result<String, String> {
     }
     let data = fs::read(path).map_err(|error| error.to_string())?;
     if let Some(rest) = data.strip_prefix(&[0xff, 0xfe]) {
-        let text: Vec<u16> = rest.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect();
+        let text: Vec<u16> = rest.as_chunks::<2>().0.iter().map(|pair| u16::from_le_bytes(*pair)).collect();
         return String::from_utf16(&text).map_err(|_| "the file isn't text".to_string());
     }
     let data = data.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&data);
@@ -106,6 +106,26 @@ pub fn login_page(config: &conf::Config, login: &Login) -> Result<Page, String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // the files of Notepad and of the other editors: UTF-16 with its mark, UTF-8 with or without its mark
+    #[test]
+    fn the_text_of_the_file() {
+        let folder = std::env::temp_dir().join(format!("authway-import-{}", std::process::id()));
+        fs::create_dir_all(&folder).unwrap();
+        let text = "[Interface]\nAddress = 10.103.1.2 # Zürich\n";
+        let mut utf16 = vec![0xff, 0xfe];
+        utf16.extend(text.encode_utf16().flat_map(u16::to_le_bytes));
+        let mut marked = vec![0xef, 0xbb, 0xbf];
+        marked.extend_from_slice(text.as_bytes());
+        for (name, data) in [("utf16.conf", utf16), ("marked.conf", marked), ("plain.conf", text.as_bytes().to_vec())] {
+            let path = folder.join(name);
+            fs::write(&path, data).unwrap();
+            assert_eq!(read_config(&path).as_deref(), Ok(text), "{}", name);
+        }
+        fs::write(folder.join("binary.conf"), [0xff, 0xfe, 0x00, 0xd8]).unwrap();
+        assert!(read_config(&folder.join("binary.conf")).is_err());
+        fs::remove_dir_all(&folder).unwrap();
+    }
 
     #[test]
     fn ready_choices() {

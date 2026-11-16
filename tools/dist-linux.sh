@@ -10,8 +10,8 @@
 # One of the two only: NO_RPM=1 or NO_DEB=1. The field Maintainer of the .deb: MAINTAINER="Name <address>".
 set -eu
 
-# the oldest Rust that builds the app: u64::is_multiple_of
-MIN_RUST=1.87
+# the oldest Rust that builds the app, the rust-version of Cargo.toml: slice::as_chunks
+MIN_RUST=1.88
 
 say() {
     printf '%s\n' "$*" >&2

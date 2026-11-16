@@ -85,7 +85,7 @@ impl Key {
 
     pub fn get_string(&self, name: &str) -> Option<String> {
         let data = self.get(name, RRF_RT_REG_SZ)?;
-        let text: Vec<u16> = data.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect();
+        let text: Vec<u16> = data.as_chunks::<2>().0.iter().map(|pair| u16::from_le_bytes(*pair)).collect();
         Some(crate::win::from_wide(&text))
     }
 

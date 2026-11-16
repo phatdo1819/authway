@@ -14,10 +14,10 @@ const K: [u32; 64] = [
 
 const BLOCK: usize = 64;
 
-fn compress(state: &mut [u32; 8], block: &[u8]) {
+fn compress(state: &mut [u32; 8], block: &[u8; BLOCK]) {
     let mut w = [0u32; 64];
-    for (index, word) in block.chunks_exact(4).enumerate() {
-        w[index] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+    for (index, word) in block.as_chunks::<4>().0.iter().enumerate() {
+        w[index] = u32::from_be_bytes(*word);
     }
     for index in 16..64 {
         let s0 = w[index - 15].rotate_right(7) ^ w[index - 15].rotate_right(18) ^ (w[index - 15] >> 3);
@@ -49,23 +49,22 @@ fn compress(state: &mut [u32; 8], block: &[u8]) {
 pub fn sha256(data: &[u8]) -> [u8; 32] {
     let mut state: [u32; 8] =
         [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
-    let mut chunks = data.chunks_exact(BLOCK);
-    for block in &mut chunks {
+    let (blocks, rest) = data.as_chunks::<BLOCK>();
+    for block in blocks {
         compress(&mut state, block);
     }
     // the rest, 0x80, zeros, then the length in bits
-    let rest = chunks.remainder();
     let mut tail = [0u8; BLOCK * 2];
     tail[..rest.len()].copy_from_slice(rest);
     tail[rest.len()] = 0x80;
     let length = if rest.len() < BLOCK - 8 { BLOCK } else { BLOCK * 2 };
     tail[length - 8..length].copy_from_slice(&((data.len() as u64) * 8).to_be_bytes());
-    for block in tail[..length].chunks_exact(BLOCK) {
+    for block in tail[..length].as_chunks::<BLOCK>().0 {
         compress(&mut state, block);
     }
     let mut digest = [0u8; 32];
-    for (bytes, word) in digest.chunks_exact_mut(4).zip(state) {
-        bytes.copy_from_slice(&word.to_be_bytes());
+    for (bytes, word) in digest.as_chunks_mut::<4>().0.iter_mut().zip(state) {
+        *bytes = word.to_be_bytes();
     }
     digest
 }
