@@ -1,7 +1,8 @@
 # The checks of every push to main and every pull request, on Windows, macOS and Linux: clippy and the tests, for the
 # build of the releases and for the test build (docs/building.md#tests), and the other processor of the packages. On
-# Linux, the .deb and the .rpm too: the .deb installed on Ubuntu, its service started, a VPN added and removed; the
-# .rpm installed on Rocky Linux 9, for its dependencies.
+# Linux, the .deb and the .rpm too, built on Rocky Linux 9 as the releases are: the .deb installed on Ubuntu, its
+# service started, a VPN added and removed; the .rpm installed on a clean Rocky Linux 9, for glibc and the
+# dependencies.
 name: CI
 
 on:
@@ -94,14 +95,48 @@ jobs:
       - name: The other processor
         run: cargo check --target aarch64-unknown-linux-gnu
 
-      # the script installs what it needs: rpmbuild here
+  # The packages of the releases, built on RHEL 9 (Rocky Linux 9): a program needs the glibc of the system that builds
+  # it, or a later one, and RHEL 9 has the oldest of the systems of the packages, 2.34
+  packages:
+    name: packages (rockylinux-9)
+    runs-on: ubuntu-latest
+    container: rockylinux:9
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # EPEL for dpkg, then the Rust of the CI with rustup: the script finds it
+      - name: Rust
+        run: |
+          dnf install -y -q epel-release
+          command -v curl >/dev/null || dnf install -y -q curl
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
+            sh -s -- -y --profile minimal --default-toolchain ${{ env.RUST }} --no-modify-path
+
+      # the script installs what it needs: gcc, rpmbuild and dpkg
       - name: The packages
         run: sh tools/dist-linux.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-packages
+          path: dist/*
+          if-no-files-found: error
+
+  deb:
+    name: ubuntu-latest .deb
+    needs: packages
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-packages
 
       # the service as the package installs it: started by systemd, a VPN added and removed by root
       - name: The .deb installed
         run: |
-          sudo apt-get install -y ./dist/authway_*_amd64.deb
+          sudo apt-get install -y ./authway_*_amd64.deb
           systemctl is-active authway.service
           test -S /run/authway.sock
           key=$(head -c 32 /dev/urandom | base64)
@@ -113,14 +148,9 @@ jobs:
           sudo test ! -e /var/lib/authway/tunnels/CI.conf
           sudo cat /var/log/authway/service.log
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: linux-packages
-          path: dist/*
-
   rpm:
-    name: rockylinux-9
-    needs: linux
+    name: rockylinux-9 .rpm
+    needs: packages
     runs-on: ubuntu-latest
     container: rockylinux:9
     timeout-minutes: 15

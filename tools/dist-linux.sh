@@ -7,11 +7,15 @@
 # It installs what the build needs and is missing, with sudo: a C compiler for the linker, dpkg-deb, rpmbuild, the
 # cross compiler for ARM64, and Rust with rustup (the Rust of the distributions is too old). NO_INSTALL=1: it never
 # installs, it says what's missing.
+# The packages run on the systems with the glibc of the one that builds them, or a later one: build the releases on
+# RHEL 9 or Rocky Linux 9 (a container is enough), the oldest glibc of the systems they're for.
 # One of the two only: NO_RPM=1 or NO_DEB=1. The field Maintainer of the .deb: MAINTAINER="Name <address>".
 set -eu
 
 # the oldest Rust that builds the app, the rust-version of Cargo.toml: slice::as_chunks
 MIN_RUST=1.88
+# the glibc of RHEL 9, the oldest of the systems of the packages: Ubuntu 22.04 has 2.35, Debian 12 2.36
+OLDEST_GLIBC=2.34
 
 say() {
     printf '%s\n' "$*" >&2
@@ -42,9 +46,14 @@ rust_version() {
     rustc --version 2>/dev/null | sed -n 's/^rustc \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p'
 }
 
+# the oldest of versions as 2.34 or 2.2.5
+oldest() {
+    printf '%s\n' "$@" | sort -t. -k1,1n -k2,2n -k3,3n | head -n 1
+}
+
 # whether the version is MIN_RUST or later
 rust_recent() {
-    [ -n "$1" ] && [ "$(printf '%s\n%s\n' "$MIN_RUST" "$1" | sort -t. -k1,1n -k2,2n | head -n 1)" = "$MIN_RUST" ]
+    [ -n "$1" ] && [ "$(oldest "$MIN_RUST" "$1")" = "$MIN_RUST" ]
 }
 
 if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ]; then
@@ -179,6 +188,14 @@ case "$TARGET" in
 esac
 
 cargo build --release --target "$TARGET" --manifest-path "$root/Cargo.toml"
+binary="$root/target/$TARGET/release/$EXECUTABLE"
+
+# the newest version of glibc the program asks for: the one of this system at most
+glibc=$(grep -ao 'GLIBC_[0-9][0-9.]*[0-9]' "$binary" | cut -c7- | sort -u -t. -k1,1nr -k2,2nr -k3,3nr | head -n 1)
+if [ -n "$glibc" ] && [ "$(oldest "$glibc" "$OLDEST_GLIBC")" != "$glibc" ]; then
+    say "the packages need glibc $glibc or later: not RHEL 9 ($OLDEST_GLIBC), maybe not Ubuntu 22.04 nor Debian 12."
+    say "For all of them, build on RHEL 9 or Rocky Linux 9."
+fi
 
 work="$root/target/linux-pkg"
 rm -rf "$work"
@@ -195,7 +212,7 @@ fill() {
 
 # the files, as they go on the computer
 linux="$root/installer/linux"
-install -D -m 755 "$root/target/$TARGET/release/$EXECUTABLE" "$files/usr/bin/$EXECUTABLE"
+install -D -m 755 "$binary" "$files/usr/bin/$EXECUTABLE"
 fill "$linux/authway.service" "$files/usr/lib/systemd/system/$LOWER.service"
 fill "$linux/authway.desktop" "$files/usr/share/applications/$LOWER.desktop"
 fill "$linux/authway-autostart.desktop" "$files/etc/xdg/autostart/$LOWER.desktop"
@@ -229,3 +246,4 @@ if [ -z "${NO_RPM:-}" ]; then
 fi
 
 ls -l "$root/dist"
+say "for the systems with glibc ${glibc:-?} or later"

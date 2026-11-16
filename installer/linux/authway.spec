@@ -4,7 +4,8 @@
 
 Name:           @LOWER@
 Version:        @VERSION@
-Release:        1%{?dist}
+# no %{?dist}: the same package for RHEL 9, RHEL 10 and Fedora, whichever system builds it
+Release:        1
 Summary:        WireGuard VPN client that logs in to the servers that require it
 License:        MIT
 URL:            https://github.com/phatdo1819/authway

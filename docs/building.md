@@ -58,9 +58,10 @@ tools/dist-linux.sh     # dist/authway_<version>_amd64.deb and dist/authway-<ver
 
 - `NO_INSTALL=1 tools/dist-linux.sh` installs nothing and says what's missing.
 - On RHEL, `dpkg` is only in EPEL: without it, the script builds the .rpm alone.
-
-- Build the packages on the oldest system they're for, Debian 12 or RHEL 9 (a container is enough): a program takes
-  the versions of glibc of the system that builds it.
+- Build the releases on RHEL 9 or Rocky Linux 9, with EPEL for the .deb (a container is enough, as in the
+  [CI](../.github/workflows/ci.yml)): a program needs the glibc of the system that builds it, or a later one, and RHEL
+  9 has the oldest of the systems of the packages, 2.34 (Ubuntu 22.04: 2.35, Debian 12: 2.36). The script says the
+  version the packages need, and warns when it's later than 2.34.
 - For ARM64: `TARGET=aarch64-unknown-linux-gnu tools/dist-linux.sh`, on ARM64, or from x86_64 on Debian or Ubuntu,
   where the script installs the cross compiler and sets it as the linker.
 - The field Maintainer of the .deb: `MAINTAINER="Name <address>" tools/dist-linux.sh`.

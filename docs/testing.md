@@ -8,11 +8,12 @@ The tests with a real firewall ran in virtual machines, on one local network:
   [ns-wgauth](https://github.com/phatdo1819/nethsecurity/tree/ci-wgauth/packages/ns-wgauth): the login, device
   binding, the fallback addresses and the copy detection;
 - a Windows 11 and a macOS virtual machine, each with Authway installed from its package, with the real WireGuard
-  drivers.
+  drivers;
+- a Linux virtual machine, with Authway built there and installed from its package: it connected, with the WireGuard
+  of the kernel.
 
-Not tested: Linux on a computer (its code compiles, its logic is tested on every system, and the CI installs its
-packages: the tunnels, the windows and the tray never ran), physical computers, a firewall in production, clients on other networks across the internet, and many
-users at once.
+Not tested: Linux beyond that one virtual machine (the other distributions, the tray of each desktop), physical
+computers, a firewall in production, clients on other networks across the internet, and many users at once.
 
 ## The test build
 
@@ -25,10 +26,10 @@ its socket is `/tmp/authway-test.sock` and its data `~/Library/Application Suppo
 
 [The CI](../.github/workflows/ci.yml) runs on every push to `main` and every pull request, on Windows, macOS and
 Linux: clippy with its warnings as errors, `cargo test` and `cargo test --features testing`, and a check of the other
-processor of the packages (ARM64 on Windows and Linux, Intel on macOS). On Linux it also builds the .deb and the .rpm,
-installs the .deb on Ubuntu (its service started by systemd, a VPN added and removed as root) and the .rpm on Rocky
-Linux 9, for its dependencies and the glibc it needs. The unit tests of the service also check, without a
-real tunnel or disk:
+processor of the packages (ARM64 on Windows and Linux, Intel on macOS). On Linux it also builds the .deb and the .rpm
+on Rocky Linux 9, as the releases are built, installs the .deb on Ubuntu (its service started by systemd, a VPN added
+and removed as root) and the .rpm on a clean Rocky Linux 9, for its dependencies and the glibc it needs. The unit tests
+of the service also check, without a real tunnel or disk:
 
 - a key the firewall has is never lost: the app saying that the firewall took a new key changes nothing until a
   handshake comes with it, and the key a new one replaces stays pending;

@@ -98,8 +98,8 @@ pub struct Tunnel {
     // cancelled while it was turning on: off as soon as it's on
     pub abandon: bool,
     pub stopping: bool,
-    // the last turn on or off asked here: the lists asked before it are older
-    pub changed_at: Instant,
+    // the last turn on or off asked here, if any: the lists asked before it are older
+    pub changed_at: Option<Instant>,
     pub up_at: Option<Instant>,
     pub error: Option<String>,
     // since when the login page doesn't answer
@@ -135,7 +135,7 @@ impl Tunnel {
             connecting_since: None,
             abandon: false,
             stopping: false,
-            changed_at: now.checked_sub(Duration::from_secs(3600)).unwrap_or(now),
+            changed_at: None,
             up_at: None,
             error: None,
             unreachable_since: None,
@@ -963,7 +963,7 @@ impl<S: Shell> App<S> {
             let (up, since) = (tunnel.info.up, tunnel.info.since);
             tunnel.info = info;
             // a list asked before the last turn on or off here doesn't know of it
-            if requested < tunnel.changed_at {
+            if tunnel.changed_at.is_some_and(|changed_at| requested < changed_at) {
                 tunnel.info.up = up;
                 tunnel.info.since = since;
             }
@@ -1025,7 +1025,7 @@ impl<S: Shell> App<S> {
                 tunnel.info.up = true;
                 tunnel.info.since = unix_now();
                 tunnel.info.handshake = 0;
-                tunnel.changed_at = now;
+                tunnel.changed_at = Some(now);
                 tunnel.on_up(now);
                 let abandon = std::mem::take(&mut tunnel.abandon);
                 self.next_list = now;
@@ -1063,7 +1063,7 @@ impl<S: Shell> App<S> {
             Ok(()) => {
                 log!("{}: off", name);
                 tunnel.info.up = false;
-                tunnel.changed_at = Instant::now();
+                tunnel.changed_at = Some(Instant::now());
                 tunnel.set_off();
             }
             Err(message) => {
@@ -1326,7 +1326,7 @@ impl<S: Shell> App<S> {
         tunnel.connecting_since = Some(now);
         tunnel.abandon = false;
         tunnel.error = None;
-        tunnel.changed_at = now;
+        tunnel.changed_at = Some(now);
         let name = tunnel.info.name.clone();
         log!("{}: connecting", name);
         self.next_list = now + LIST_ACTIVE;
@@ -1362,7 +1362,7 @@ impl<S: Shell> App<S> {
             } else if tunnel.info.up {
                 log!("{}: disconnecting, another VPN goes on", tunnel.name());
                 tunnel.stopping = true;
-                tunnel.changed_at = now;
+                tunnel.changed_at = Some(now);
                 if let Some((page, interface)) = tunnel.session_page() {
                     logouts.push((tunnel.info.name.clone(), page, interface));
                 }
@@ -1389,7 +1389,7 @@ impl<S: Shell> App<S> {
             if on {
                 log!("{}: off", name);
                 tunnel.info.up = false;
-                tunnel.changed_at = now;
+                tunnel.changed_at = Some(now);
                 tunnel.set_off();
             }
         }
@@ -1437,7 +1437,7 @@ impl<S: Shell> App<S> {
             return;
         }
         tunnel.stopping = true;
-        tunnel.changed_at = Instant::now();
+        tunnel.changed_at = Some(Instant::now());
         let session_page = tunnel.session_page();
         let name = name.to_string();
         log!("{}: disconnecting", name);
